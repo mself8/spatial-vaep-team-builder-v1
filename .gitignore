@@ -1,0 +1,14 @@
+# 1. 파이썬 및 시스템 캐시 파일
+__pycache__/
+*.pyc
+.DS_Store
+.env
+venv/
+.venv/
+
+# 2. 용량이 큰 데이터 파일 및 폴더
+데이터/
+archive/
+*.parquet
+*.csv
+*.json
