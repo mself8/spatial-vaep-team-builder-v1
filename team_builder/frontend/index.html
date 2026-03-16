@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Team-Builder Dashboard</title>
+    <link rel="stylesheet" href="./styles.css?v=20260309b" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Team-Builder Dashboard</h1>
+      <div class="controls">
+        <label>
+          Our Team
+          <select id="teamNameSelect"></select>
+        </label>
+        <label>
+          Opponent Team
+          <select id="opponentNameSelect"></select>
+        </label>
+        <input id="teamId" type="hidden" value="1611" />
+        <input id="opponentId" type="hidden" value="1625" />
+        <button id="runOptimizeBtn" class="primary">최적화 실행</button>
+      </div>
+    </header>
+
+    <main class="dashboard-grid">
+      <section class="panel tactic-view" id="tacticView">
+        <div class="panel-header">
+          <h2>Tactic View</h2>
+          <p>Confrontation Tactic Lists & 가중치 조절</p>
+          <div class="team-toggle" id="tacticTeamToggle">
+            <button class="team-tab active" data-team="our">Our Team</button>
+            <button class="team-tab" data-team="opponent">Opponent Team</button>
+          </div>
+        </div>
+        <div class="tactic-columns">
+          <div>
+            <h3 id="tacticColTitleLeft">우리팀 공격 전술</h3>
+            <div id="homeTacticList" class="tactic-list"></div>
+          </div>
+          <div>
+            <h3 id="tacticColTitleRight">상대팀 수비 전술</h3>
+            <div id="awayTacticList" class="tactic-list"></div>
+          </div>
+        </div>
+        <div id="tacticLegend" class="tactic-legend"></div>
+      </section>
+
+      <section class="panel player-view" id="playerView">
+        <div class="panel-header player-header">
+          <h2>Player View</h2>
+          <div class="tab-group">
+            <button class="tab active" data-tab="edit">Edit Board</button>
+            <button class="tab" data-tab="explain">Explanation</button>
+          </div>
+        </div>
+
+        <div id="tab-edit" class="tab-pane active">
+          <div class="edit-layout">
+            <div class="pitch-wrap">
+              <h3>선발 11명 Pitch</h3>
+              <div id="mainPitch" class="pitch"></div>
+            </div>
+            <aside class="candidate-wrap">
+              <h3>전체 선수 (VI / IO / ID)</h3>
+              <div id="candidateList" class="candidate-list"></div>
+            </aside>
+            <aside class="constraints-wrap">
+              <h3>포메이션 조절 슬라이더</h3>
+              <div id="constraintsPanel" class="constraints-panel">
+                <div class="constraint-row" data-role="forwards">
+                  <label>Forwards (F)</label>
+                  <div class="constraint-inputs">
+                    <input type="range" data-key="count" min="1" max="5" value="3" />
+                    <span class="constraint-val" data-key="value">3</span>
+                  </div>
+                </div>
+                <div class="constraint-row" data-role="midfielders">
+                  <label>Midfielders (M)</label>
+                  <div class="constraint-inputs">
+                    <input type="range" data-key="count" min="1" max="5" value="3" />
+                    <span class="constraint-val" data-key="value">3</span>
+                  </div>
+                </div>
+                <div class="constraint-row" data-role="defenders">
+                  <label>Defenders (D)</label>
+                  <div class="constraint-inputs">
+                    <input type="range" data-key="count" min="1" max="5" value="4" />
+                    <span class="constraint-val" data-key="value">4</span>
+                  </div>
+                </div>
+                <div class="constraint-note" id="constraintNote">F+M+D = 10 (GK 1명 고정)</div>
+              </div>
+            </aside>
+          </div>
+        </div>
+
+        <div id="tab-explain" class="tab-pane">
+          <div class="explain-toolbar">
+            <button class="mode-btn active" data-mode="offensive">Offensive (I_O)</button>
+            <button class="mode-btn" data-mode="defensive">Defensive (I_D)</button>
+          </div>
+          <div class="matrix-layout">
+            <aside id="matrixYLabels" class="matrix-y"></aside>
+            <div id="matrixMain" class="matrix-main">
+              <div id="matrixXGroups" class="matrix-x-groups"></div>
+              <div id="synergyMatrix" class="matrix-grid"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel lineup-view" id="lineupView">
+        <div class="panel-header">
+          <h2>Lineup View</h2>
+          <p>대안 라인업 비교 · 승률/출전횟수/예상지표</p>
+        </div>
+        <div class="lineup-table" id="lineupAlternatives"></div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast"></div>
+
+    <div id="lineupModal" class="modal-overlay" aria-hidden="true">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h3 id="modalTitle">라인업 상세</h3>
+          <button id="closeModalBtn" class="modal-close">닫기</button>
+        </div>
+        <div id="modalSpinner" class="modal-spinner">불러오는 중...</div>
+        <div id="modalBody" class="modal-body"></div>
+      </div>
+    </div>
+
+    <script src="./app.js?v=20260309b"></script>
+  </body>
+</html>
