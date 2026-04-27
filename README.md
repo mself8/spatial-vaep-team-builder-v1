@@ -9,7 +9,23 @@ The code is organized into four runnable pillars:
 - `proposed_spatial_gnn_ga/`: 12-zone spatial GNN dataset builder, GNN training, and GA lineup optimization
 - `evaluation_comparison/`: final hit-rate comparison between GNN and Team-Builder
 
+## 💾 Data Preparation (데이터 준비)
 
+이 코드를 실행하려면 원본 데이터셋이 필요합니다. 
+용량 문제로 데이터는 깃허브에 포함되어 있지 않습니다.
+
+1. [Kaggle 데이터셋 링크(여기에 링크 삽입)]에서 데이터를 다운로드합니다.
+2. 다운로드한 압축 파일을 풀고, 아래 구조와 같이 `data/archive/` 폴더 안에 넣어주세요.
+
+```text
+프로젝트_폴더/
+├── data/
+│   └── archive/
+│       ├── matches.csv      <-- 여기에 파일 위치!
+│       ├── players.csv      <-- 여기에 파일 위치!
+│       └── ...
+├── optimize_lineup_ga_phase6.py
+└── README.md
 
 ## Repository Layout
 

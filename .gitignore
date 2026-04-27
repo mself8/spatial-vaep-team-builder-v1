@@ -21,3 +21,9 @@ data/
 # Common generated experiment folders
 AutogluonModels/
 catboost_info/
+
+# data 폴더 안의 모든 파일은 무시하되,
+data/*
+
+# .gitkeep 파일과 archive 폴더 구조 자체는 깃허브에 올려라!
+!data/archive/.gitkeep
