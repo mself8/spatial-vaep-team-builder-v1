@@ -8,7 +8,7 @@ venv/
 .venv/
 
 # Generated data and model artifacts
-data/
+# data/  <--- 🚨 이 부분을 꼭 지우거나 주석 처리하세요!
 *.csv
 *.parquet
 *.pt
@@ -25,5 +25,6 @@ catboost_info/
 # data 폴더 안의 모든 파일은 무시하되,
 data/*
 
-# .gitkeep 파일과 archive 폴더 구조 자체는 깃허브에 올려라!
+# archive 폴더 자체와 .gitkeep 파일은 깃허브에 올려라!
+!data/archive/
 !data/archive/.gitkeep
