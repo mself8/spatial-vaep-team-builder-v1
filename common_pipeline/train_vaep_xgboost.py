@@ -11,12 +11,16 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from xgboost import XGBClassifier
 
 import socceraction.spadl as spadl
 from socceraction.vaep import features, formula, labels
 from socceraction.vaep.base import xfns_default
+
+PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
+DATA_DIR = PROJECT_ROOT / "data"
 
 
 # 기능: 문자열 기반 리스트/딕셔너리를 안전하게 파싱해 후속 컬럼 추출 오류를 방지한다.
@@ -105,7 +109,11 @@ def _extract_home_team_series(matches: pd.DataFrame) -> pd.Series:
 
 # 기능: SPADL 디렉터리의 처리 대상 리그 목록을 만든다.
 # 동작/맥락: spadl_*.parquet를 스캔하고 include 인자가 있으면 필터링한다.
-def _iter_spadl_leagues(spadl_dir: Path, include: list[str] | None) -> list[str]:
+def _iter_spadl_leagues(
+    spadl_dir: Path,
+    include: list[str] | None,
+    exclude: list[str] | None,
+) -> list[str]:
     leagues = sorted(
         p.stem.replace("spadl_", "")
         for p in spadl_dir.glob("spadl_*.parquet")
@@ -113,7 +121,10 @@ def _iter_spadl_leagues(spadl_dir: Path, include: list[str] | None) -> list[str]
     )
     if include:
         include_set = set(include)
-        return [league for league in leagues if league in include_set]
+        leagues = [league for league in leagues if league in include_set]
+    if exclude:
+        exclude_norm = {e.strip().lower() for e in exclude if str(e).strip()}
+        leagues = [league for league in leagues if league.lower() not in exclude_norm]
     return leagues
 
 
@@ -129,10 +140,9 @@ def _build_games_meta(data_dir: Path, league: str) -> pd.DataFrame:
 
 
 # 기능: 단일 경기 액션에서 VAEP 학습용 X/y를 생성한다.
-# 동작/맥락: gamestates→left_to_right→xfns_default 특성, labels.scores/concedes 라벨을 만든다.
+# 동작/맥락: gamestates→xfns_default 특성, labels.scores/concedes 라벨을 만든다.
 def _compute_features_and_labels_for_game(
     actions: pd.DataFrame,
-    home_team_id: int,
     nb_prev_actions: int,
     nr_actions: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -140,8 +150,9 @@ def _compute_features_and_labels_for_game(
     named_actions = spadl.add_names(game_actions)
 
     gs = features.gamestates(named_actions, nb_prev_actions=nb_prev_actions)
-    gs_ltr = features.play_left_to_right(gs, home_team_id=home_team_id)
-    X_game = pd.concat([fn(gs_ltr) for fn in xfns_default], axis=1)
+    # Phase 1 conversion already applies left-to-right normalization.
+    # Re-applying it here can flip coordinates twice for away-team actions.
+    X_game = pd.concat([fn(gs) for fn in xfns_default], axis=1)
 
     y_scores = labels.scores(named_actions, nr_actions=nr_actions)
     y_concedes = labels.concedes(named_actions, nr_actions=nr_actions)
@@ -183,29 +194,25 @@ def _fit_binary_xgb(
     return model
 
 
-# 기능: Phase2 전체 파이프라인(특성 생성→모델 학습→VAEP 산출→저장)을 수행한다.
-# 동작/맥락: 리그/경기 루프를 돌며 OOF가 아닌 전체 예측 기반 p_scores/p_concedes와 vaep_actions를 생성한다.
-def run_phase2(
+# 기능: 다중 리그 SPADL에서 경기 단위로 VAEP 학습용 X/y를 수집한다.
+# 동작/맥락: run_phase2의 학습/평가(특히 OOD 평가)에서 공통으로 사용된다.
+def _collect_xy_for_leagues(
     data_dir: Path,
     spadl_dir: Path,
-    output_dir: Path,
-    leagues: list[str] | None,
+    leagues: list[str],
     nb_prev_actions: int,
     nr_actions: int,
-    val_size: float,
-    random_state: int,
     max_games: int | None,
-) -> None:
-    selected_leagues = _iter_spadl_leagues(spadl_dir, leagues)
-    if not selected_leagues:
-        raise RuntimeError("No SPADL league parquet files found to train VAEP.")
-
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     feature_frames: list[pd.DataFrame] = []
     label_frames: list[pd.DataFrame] = []
-    action_frames: list[pd.DataFrame] = []
 
-    for league in selected_leagues:
+    for league in leagues:
         spadl_path = spadl_dir / f"spadl_{league}.parquet"
+        if not spadl_path.exists():
+            print(f"[WARN] Missing SPADL file for league={league}: {spadl_path}")
+            continue
+
         actions = pd.read_parquet(spadl_path)
         games_meta = _build_games_meta(data_dir, league)
         home_team_by_game = games_meta.set_index("game_id")["home_team_id"].to_dict()
@@ -222,36 +229,106 @@ def run_phase2(
                 continue
             X_game, y_game = _compute_features_and_labels_for_game(
                 actions=game_actions,
-                home_team_id=int(home_team_by_game[game_id]),
                 nb_prev_actions=nb_prev_actions,
                 nr_actions=nr_actions,
             )
             feature_frames.append(X_game)
             label_frames.append(y_game)
-            action_frames.append(game_actions[["game_id", "action_id"]].copy())
 
     if not feature_frames:
-        raise RuntimeError("No game features were generated. Check matches/home_team mapping.")
+        return pd.DataFrame(), pd.DataFrame()
 
     X_all = pd.concat(feature_frames, ignore_index=True)
     y_all = pd.concat(label_frames, ignore_index=True)
+    return X_all, y_all
+
+
+# 기능: 이진 분류 확률 예측의 핵심 품질 지표를 계산한다.
+# 동작/맥락: holdout/OOD 공통 보고에서 auc/logloss/brier와 base-rate 정합성을 기록한다.
+def _binary_metrics(y_true: pd.Series, y_prob: np.ndarray) -> dict[str, float | None]:
+    y_true_np = y_true.to_numpy(dtype=int)
+
+    try:
+        auc = float(roc_auc_score(y_true_np, y_prob)) if np.unique(y_true_np).shape[0] >= 2 else None
+    except Exception:
+        auc = None
+
+
+    return {
+        "auc": auc,
+        "logloss": float(log_loss(y_true_np, y_prob, labels=[0, 1])),
+        "brier": float(brier_score_loss(y_true_np, y_prob)),
+        "positive_rate": float(np.mean(y_true_np)),
+        "mean_pred": float(np.mean(y_prob)),
+    }
+
+
+# 기능: 학습 feature 스키마에 맞게 평가용 행렬 컬럼을 정렬/보정한다.
+# 동작/맥락: 리그별 데이터 편차로 누락된 특성은 0으로 채우고 초과 컬럼은 제거한다.
+def _align_feature_matrix(X: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    aligned = X.copy()
+    missing = [c for c in feature_cols if c not in aligned.columns]
+    for c in missing:
+        aligned[c] = 0.0
+    aligned = aligned[feature_cols]
+    return aligned.astype(float)
+
+
+# 기능: Phase2 전체 파이프라인(특성 생성→모델 학습→VAEP 산출→저장)을 수행한다.
+# 동작/맥락: 리그/경기 루프를 돌며 OOF가 아닌 전체 예측 기반 p_scores/p_concedes와 vaep_actions를 생성한다.
+def run_phase2(
+    data_dir: Path,
+    spadl_dir: Path,
+    output_dir: Path,
+    leagues: list[str] | None,
+    exclude_leagues: list[str] | None,
+    nb_prev_actions: int,
+    nr_actions: int,
+    val_size: float,
+    random_state: int,
+    max_games: int | None,
+    split_mode: str,
+    ood_leagues: list[str] | None,
+) -> None:
+    selected_leagues = _iter_spadl_leagues(spadl_dir, leagues, exclude_leagues)
+    if not selected_leagues:
+        raise RuntimeError("No SPADL league parquet files found to train VAEP.")
+    print(f"[INFO] Selected leagues for training: {selected_leagues}")
+
+    X_all, y_all = _collect_xy_for_leagues(
+        data_dir=data_dir,
+        spadl_dir=spadl_dir,
+        leagues=selected_leagues,
+        nb_prev_actions=nb_prev_actions,
+        nr_actions=nr_actions,
+        max_games=max_games,
+    )
+
+    if X_all.empty:
+        raise RuntimeError("No game features were generated. Check matches/home_team mapping.")
 
     key_cols = ["game_id", "action_id"]
     feature_cols = [c for c in X_all.columns if c not in key_cols]
 
-    X_matrix = X_all[feature_cols].copy()
-    X_matrix = X_matrix.astype(float)
+    X_matrix = _align_feature_matrix(X_all[feature_cols].copy(), feature_cols)
 
     y_scores = y_all["scores"].astype(int)
     y_concedes = y_all["concedes"].astype(int)
+    groups = pd.to_numeric(X_all["game_id"], errors="coerce").fillna(-1).astype(int).to_numpy()
 
     idx = np.arange(len(X_matrix))
-    train_idx, valid_idx = train_test_split(
-        idx,
-        test_size=val_size,
-        random_state=random_state,
-        shuffle=True,
-    )
+    if split_mode == "group_game":
+        gss = GroupShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
+        train_idx, valid_idx = next(gss.split(idx, y_scores.to_numpy(), groups=groups))
+    elif split_mode == "random":
+        train_idx, valid_idx = train_test_split(
+            idx,
+            test_size=val_size,
+            random_state=random_state,
+            shuffle=True,
+        )
+    else:
+        raise ValueError(f"Unsupported split_mode: {split_mode}")
 
     X_train = X_matrix.iloc[train_idx]
     X_valid = X_matrix.iloc[valid_idx]
@@ -273,6 +350,79 @@ def run_phase2(
         y_concedes.iloc[valid_idx],
         random_state=random_state + 7,
     )
+
+    # Holdout validation metrics for reproducibility and regression checks.
+    p_scores_valid = model_scores.predict_proba(X_valid)[:, 1]
+    p_concedes_valid = model_concedes.predict_proba(X_valid)[:, 1]
+
+    valid_games = int(np.unique(groups[valid_idx]).shape[0])
+    train_games = int(np.unique(groups[train_idx]).shape[0])
+    metrics = {
+        "n_samples_total": int(len(X_matrix)),
+        "n_train": int(len(train_idx)),
+        "n_valid": int(len(valid_idx)),
+        "n_games_train": train_games,
+        "n_games_valid": valid_games,
+        "val_size": float(val_size),
+        "split_mode": split_mode,
+        "scores": {
+            **_binary_metrics(y_scores.iloc[valid_idx], p_scores_valid),
+        },
+        "concedes": {
+            **_binary_metrics(y_concedes.iloc[valid_idx], p_concedes_valid),
+        },
+    }
+
+    ood_rows: list[dict[str, float | int | str | None]] = []
+    if ood_leagues:
+        X_ood, y_ood = _collect_xy_for_leagues(
+            data_dir=data_dir,
+            spadl_dir=spadl_dir,
+            leagues=ood_leagues,
+            nb_prev_actions=nb_prev_actions,
+            nr_actions=nr_actions,
+            max_games=max_games,
+        )
+        if X_ood.empty:
+            print(f"[WARN] OOD leagues had no usable samples: {ood_leagues}")
+        else:
+            X_ood_matrix = _align_feature_matrix(X_ood, feature_cols)
+            p_scores_ood = model_scores.predict_proba(X_ood_matrix)[:, 1]
+            p_concedes_ood = model_concedes.predict_proba(X_ood_matrix)[:, 1]
+
+            y_scores_ood = y_ood["scores"].astype(int)
+            y_concedes_ood = y_ood["concedes"].astype(int)
+            n_games_ood = int(pd.to_numeric(X_ood["game_id"], errors="coerce").nunique())
+
+            scores_ood_metrics = _binary_metrics(y_scores_ood, p_scores_ood)
+            concedes_ood_metrics = _binary_metrics(y_concedes_ood, p_concedes_ood)
+
+            ood_rows.append(
+                {
+                    "target": "scores",
+                    "eval_leagues": "|".join(ood_leagues),
+                    "n_samples": int(len(X_ood_matrix)),
+                    "n_games": n_games_ood,
+                    "auc": scores_ood_metrics["auc"],
+                    "logloss": scores_ood_metrics["logloss"],
+                    "brier": scores_ood_metrics["brier"],
+                    "positive_rate": scores_ood_metrics["positive_rate"],
+                    "mean_pred": scores_ood_metrics["mean_pred"],
+                }
+            )
+            ood_rows.append(
+                {
+                    "target": "concedes",
+                    "eval_leagues": "|".join(ood_leagues),
+                    "n_samples": int(len(X_ood_matrix)),
+                    "n_games": n_games_ood,
+                    "auc": concedes_ood_metrics["auc"],
+                    "logloss": concedes_ood_metrics["logloss"],
+                    "brier": concedes_ood_metrics["brier"],
+                    "positive_rate": concedes_ood_metrics["positive_rate"],
+                    "mean_pred": concedes_ood_metrics["mean_pred"],
+                }
+            )
 
     p_scores = model_scores.predict_proba(X_matrix)[:, 1]
     p_concedes = model_concedes.predict_proba(X_matrix)[:, 1]
@@ -330,12 +480,43 @@ def run_phase2(
                 "feature_cols": feature_cols,
                 "nb_prev_actions": nb_prev_actions,
                 "nr_actions": nr_actions,
+                "holdout_metrics": metrics,
             },
             f,
         )
 
+    metrics_path_json = output_dir / "vaep_holdout_metrics.json"
+    metrics_path_csv = output_dir / "vaep_holdout_metrics.csv"
+    metrics_path_json.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    pd.DataFrame(
+        [
+            {
+                "target": "scores",
+                "auc": metrics["scores"]["auc"],
+                "logloss": metrics["scores"]["logloss"],
+                "brier": metrics["scores"]["brier"],
+                "positive_rate_valid": metrics["scores"]["positive_rate"],
+                "mean_pred_valid": metrics["scores"]["mean_pred"],
+            },
+            {
+                "target": "concedes",
+                "auc": metrics["concedes"]["auc"],
+                "logloss": metrics["concedes"]["logloss"],
+                "brier": metrics["concedes"]["brier"],
+                "positive_rate_valid": metrics["concedes"]["positive_rate"],
+                "mean_pred_valid": metrics["concedes"]["mean_pred"],
+            },
+        ]
+    ).to_csv(metrics_path_csv, index=False)
+
+    if ood_rows:
+        ood_csv_path = output_dir / "vaep_ood_metrics.csv"
+        pd.DataFrame(ood_rows).to_csv(ood_csv_path, index=False)
+        print(f"[OK] Saved OOD metrics: {ood_csv_path}")
+
     print(f"[OK] Saved VAEP actions: {vaep_path}")
     print(f"[OK] Saved models: {models_path}")
+    print(f"[OK] Saved holdout metrics: {metrics_path_json}")
     print(f"[OK] Rows: {len(vaep_actions):,}")
 
 
@@ -346,27 +527,46 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/archive"),
+        default=DATA_DIR / "archive",
         help="Directory containing matches_* and players/events source files",
     )
     parser.add_argument(
         "--spadl-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/spadl"),
+        default=DATA_DIR / "spadl",
         help="Directory containing spadl_*.parquet",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/vaep"),
+        default=DATA_DIR / "vaep",
         help="Directory to write VAEP outputs",
     )
     parser.add_argument("--leagues", nargs="*", default=None, help="Optional league names")
+    parser.add_argument(
+        "--exclude-leagues",
+        nargs="*",
+        default=["England"],
+        help="League names to exclude from training (default: England)",
+    )
     parser.add_argument("--nb-prev-actions", type=int, default=3)
     parser.add_argument("--nr-actions", type=int, default=10, help="Label horizon for scores/concedes")
     parser.add_argument("--val-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--max-games", type=int, default=None, help="Optional quick-run cap for games")
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        choices=["group_game", "random"],
+        default="group_game",
+        help="Validation split strategy. group_game prevents leakage across actions in same game.",
+    )
+    parser.add_argument(
+        "--ood-leagues",
+        nargs="*",
+        default=["England"],
+        help="Optional leagues for out-of-domain evaluation report CSV (not used for training).",
+    )
     args = parser.parse_args()
 
     run_phase2(
@@ -374,11 +574,14 @@ def main() -> None:
         spadl_dir=args.spadl_dir,
         output_dir=args.output_dir,
         leagues=args.leagues,
+        exclude_leagues=args.exclude_leagues,
         nb_prev_actions=args.nb_prev_actions,
         nr_actions=args.nr_actions,
         val_size=args.val_size,
         random_state=args.random_state,
         max_games=args.max_games,
+        split_mode=args.split_mode,
+        ood_leagues=args.ood_leagues,
     )
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 from collections import Counter
 from itertools import combinations
 from pathlib import Path
@@ -23,6 +24,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
+DATA_DIR = PROJECT_ROOT / "data"
 
 
 DEFENSIVE_SUCCESS_TYPES = {"interception", "tackle"}
@@ -77,6 +82,10 @@ def _load_phase4_inputs(
 # 동작/맥락: original_event_id 기준 병합 후 vaep_value 결측을 0으로 보정해 상호작용 계산 입력을 만든다.
 def _attach_vaep_to_atomic(vaep: pd.DataFrame, atomic: pd.DataFrame) -> pd.DataFrame:
     agg_map: dict[str, tuple[str, str]] = {"vaep_value": ("vaep_value", "mean")}
+    if "start_x" in vaep.columns:
+        agg_map["x"] = ("start_x", "mean")
+    if "start_y" in vaep.columns:
+        agg_map["y"] = ("start_y", "mean")
     if "offensive_value" in vaep.columns:
         agg_map["offensive_value"] = ("offensive_value", "mean")
     if "defensive_value" in vaep.columns:
@@ -101,6 +110,26 @@ def _attach_vaep_to_atomic(vaep: pd.DataFrame, atomic: pd.DataFrame) -> pd.DataF
         atomic_enriched["vaep_value"] = 0.0
     else:
         atomic_enriched["vaep_value"] = pd.to_numeric(atomic_enriched["vaep_value"], errors="coerce").fillna(0.0)
+
+    if "x_x" in atomic_enriched.columns and "x_y" in atomic_enriched.columns:
+        atomic_enriched["x"] = pd.to_numeric(atomic_enriched["x_x"], errors="coerce").fillna(
+            pd.to_numeric(atomic_enriched["x_y"], errors="coerce")
+        )
+        atomic_enriched = atomic_enriched.drop(columns=["x_x", "x_y"])
+    elif "x" in atomic_enriched.columns:
+        atomic_enriched["x"] = pd.to_numeric(atomic_enriched["x"], errors="coerce")
+    else:
+        atomic_enriched["x"] = np.nan
+
+    if "y_x" in atomic_enriched.columns and "y_y" in atomic_enriched.columns:
+        atomic_enriched["y"] = pd.to_numeric(atomic_enriched["y_x"], errors="coerce").fillna(
+            pd.to_numeric(atomic_enriched["y_y"], errors="coerce")
+        )
+        atomic_enriched = atomic_enriched.drop(columns=["y_x", "y_y"])
+    elif "y" in atomic_enriched.columns:
+        atomic_enriched["y"] = pd.to_numeric(atomic_enriched["y"], errors="coerce")
+    else:
+        atomic_enriched["y"] = np.nan
 
     for col in ["offensive_value", "defensive_value"]:
         if col not in atomic_enriched.columns:
@@ -487,13 +516,15 @@ def _compute_io(
     attack_default_weight: float,
     min_pair_minutes: float,
     low_pair_policy: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = atomic_enriched.copy()
 
     grp = ["game_id", "phase_id"]
     df["next_player_id"] = df.groupby(grp)["player_id"].shift(-1)
     df["next_team_id"] = df.groupby(grp)["team_id"].shift(-1)
     df["next_vaep_value"] = df.groupby(grp)["vaep_value"].shift(-1)
+    df["next_x"] = df.groupby(grp)["x"].shift(-1)
+    df["next_y"] = df.groupby(grp)["y"].shift(-1)
 
     io_pairs = df[df["next_player_id"].notna()].copy()
     io_pairs = io_pairs[io_pairs["player_id"] != io_pairs["next_player_id"]]
@@ -518,6 +549,94 @@ def _compute_io(
 
     io_pairs["player_i"] = io_pairs[["player_id", "next_player_id"]].min(axis=1).astype(int)
     io_pairs["player_j"] = io_pairs[["player_id", "next_player_id"]].max(axis=1).astype(int)
+
+    io_event_base_shared = io_pairs[
+        [
+            "game_id",
+            "phase_id",
+            "period_id",
+            "time_seconds",
+            "team_id",
+            "player_i",
+            "player_j",
+            "player_id",
+            "next_player_id",
+            "attack_tactic_id",
+            "x",
+            "y",
+            "next_x",
+            "next_y",
+            "vaep_value",
+            "next_vaep_value",
+            "attack_weight",
+        ]
+    ].copy()
+    io_event_base_shared = io_event_base_shared.rename(
+        columns={
+            "player_i": "player_a_id",
+            "player_j": "player_b_id",
+            "player_id": "actor_player_id",
+            "next_player_id": "receiver_player_id",
+            "vaep_value": "first_action_vaep",
+            "next_vaep_value": "second_action_vaep",
+        }
+    )
+    io_event_base_shared["pair_key"] = io_event_base_shared.apply(
+        lambda r: f"{int(r['team_id'])}_{int(r['player_a_id'])}_{int(r['player_b_id'])}", axis=1
+    )
+
+    # Spatial contribution split: first action VAEP at first location,
+    # second action VAEP at second location.
+    io_first = io_event_base_shared[
+        [
+            "game_id",
+            "phase_id",
+            "period_id",
+            "time_seconds",
+            "team_id",
+            "player_a_id",
+            "player_b_id",
+            "pair_key",
+            "actor_player_id",
+            "receiver_player_id",
+            "attack_tactic_id",
+            "x",
+            "y",
+            "first_action_vaep",
+            "attack_weight",
+        ]
+    ].copy()
+    io_first["io_event_raw"] = pd.to_numeric(io_first["first_action_vaep"], errors="coerce").fillna(0.0)
+    io_first["io_event_weighted"] = io_first["io_event_raw"] * pd.to_numeric(io_first["attack_weight"], errors="coerce").fillna(1.0)
+    io_first["contribution_source"] = "first_action"
+    io_first = io_first.drop(columns=["first_action_vaep"])
+
+    io_second = io_event_base_shared[
+        [
+            "game_id",
+            "phase_id",
+            "period_id",
+            "time_seconds",
+            "team_id",
+            "player_a_id",
+            "player_b_id",
+            "pair_key",
+            "actor_player_id",
+            "receiver_player_id",
+            "attack_tactic_id",
+            "next_x",
+            "next_y",
+            "second_action_vaep",
+            "attack_weight",
+        ]
+    ].copy()
+    io_second = io_second.rename(columns={"next_x": "x", "next_y": "y"})
+    io_second["io_event_raw"] = pd.to_numeric(io_second["second_action_vaep"], errors="coerce").fillna(0.0)
+    io_second["io_event_weighted"] = io_second["io_event_raw"] * pd.to_numeric(io_second["attack_weight"], errors="coerce").fillna(1.0)
+    io_second["contribution_source"] = "second_action"
+    io_second = io_second.drop(columns=["second_action_vaep"])
+
+    io_event_base = pd.concat([io_first, io_second], ignore_index=True)
 
     io_agg = (
         io_pairs.groupby(["team_id", "player_i", "player_j"], as_index=False)
@@ -566,7 +685,11 @@ def _compute_io(
         .agg(io=("io", "sum"), io_events=("io", "count"))
     )
 
-    return io_pair_list.sort_values("io", ascending=False).reset_index(drop=True), io_player
+    return (
+        io_pair_list.sort_values("io", ascending=False).reset_index(drop=True),
+        io_player,
+        io_event_base.reset_index(drop=True),
+    )
 
 
 # 기능: 소유권 전환 시 수비 성공 이벤트를 기반으로 방어 상호작용 I_D를 계산한다.
@@ -578,7 +701,7 @@ def _compute_id(
     defense_default_weight: float,
     min_pair_minutes: float,
     low_pair_policy: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = atomic_enriched.sort_values(["game_id", "period_id", "time_seconds", "action_id"]).reset_index(drop=True).copy()
 
     df["prev_game_id"] = df["game_id"].shift(1)
@@ -615,7 +738,26 @@ def _compute_id(
             ]
         )
         empty_player = pd.DataFrame(columns=["player_id", "id", "id_events"])
-        return empty_pairs, empty_player
+        empty_events = pd.DataFrame(
+            columns=[
+                "game_id",
+                "phase_id",
+                "period_id",
+                "time_seconds",
+                "defending_team_id",
+                "defender_player_id",
+                "opponent_team_id",
+                "opponent_player_id",
+                "defense_tactic_id",
+                "x",
+                "y",
+                "id_event_raw",
+                "defense_weight",
+                "id_event_weighted",
+                "pair_key",
+            ]
+        )
+        return empty_pairs, empty_player, empty_events
 
     candidates["defending_team_id"] = candidates["team_id"].astype(int)
     candidates["defender_player_id"] = candidates["player_id"].astype(int)
@@ -634,6 +776,35 @@ def _compute_id(
         axis=1,
     )
     candidates["id_weighted_event"] = candidates["id_raw_event"] * candidates["defense_weight"]
+
+    id_event_base = candidates[
+        [
+            "game_id",
+            "phase_id",
+            "period_id",
+            "time_seconds",
+            "defending_team_id",
+            "defender_player_id",
+            "opponent_team_id",
+            "opponent_player_id",
+            "defense_tactic_id",
+            "x",
+            "y",
+            "id_raw_event",
+            "defense_weight",
+            "id_weighted_event",
+        ]
+    ].copy()
+    id_event_base = id_event_base.rename(
+        columns={
+            "id_raw_event": "id_event_raw",
+            "id_weighted_event": "id_event_weighted",
+        }
+    )
+    id_event_base["pair_key"] = id_event_base.apply(
+        lambda r: f"{int(r['defending_team_id'])}_{int(r['defender_player_id'])}_{int(r['opponent_team_id'])}_{int(r['opponent_player_id'])}",
+        axis=1,
+    )
 
     id_pair = (
         candidates.groupby(
@@ -680,7 +851,11 @@ def _compute_id(
         .rename(columns={"defender_player_id": "player_id"})
     )
 
-    return id_pair.sort_values("id", ascending=False).reset_index(drop=True), id_player
+    return (
+        id_pair.sort_values("id", ascending=False).reset_index(drop=True),
+        id_player,
+        id_event_base.reset_index(drop=True),
+    )
 
 
 # 기능: IO 쌍 리스트를 선수×선수 매트릭스로 변환한다.
@@ -709,10 +884,13 @@ def _build_io_matrix(io_pair: pd.DataFrame) -> pd.DataFrame:
 
 # 기능: matches_*.csv에서 팀-경기 포인트/승리 라벨을 로드한다.
 # 동작/맥락: lambda 추정 학습용 타깃(points/is_win)을 game_id, team_id 단위로 구성한다.
-def _load_match_points(matches_dir: Path, game_ids: set[int] | None = None) -> pd.DataFrame:
-    files = sorted(matches_dir.glob("matches_*.csv"))
+def _load_match_points(matches_dir: Path, game_ids: set[int] | None = None, matches_csv: Path | None = None) -> pd.DataFrame:
+    if matches_csv is not None:
+        files = [matches_csv]
+    else:
+        files = sorted(matches_dir.glob("matches_*.csv"))
     if not files:
-        raise FileNotFoundError(f"No matches_*.csv found in {matches_dir}")
+        raise FileNotFoundError(f"No match csv found. matches_dir={matches_dir}, matches_csv={matches_csv}")
 
     parts: list[pd.DataFrame] = []
     for file in files:
@@ -771,6 +949,37 @@ def _load_match_points(matches_dir: Path, game_ids: set[int] | None = None) -> p
 
     out = pd.concat(parts, ignore_index=True).drop_duplicates(["game_id", "team_id"]).reset_index(drop=True)
     return out
+
+
+def _resolve_lambda_excluded_game_ids(
+    explicit_game_ids: list[int] | None,
+    test_fold_csv: Path | None,
+    test_fold_col: str,
+    test_fold_value: int | None,
+    test_game_id_col: str,
+) -> set[int]:
+    excluded: set[int] = set(int(x) for x in (explicit_game_ids or []))
+
+    if test_fold_csv is None:
+        return excluded
+    if not test_fold_csv.exists():
+        raise FileNotFoundError(f"lambda test fold csv not found: {test_fold_csv}")
+    if test_fold_value is None:
+        raise ValueError("--lambda-test-fold must be provided when --lambda-test-fold-csv is used")
+
+    fold_df = pd.read_csv(test_fold_csv)
+    required = {test_fold_col, test_game_id_col}
+    miss = sorted(required - set(fold_df.columns))
+    if miss:
+        raise ValueError(
+            f"{test_fold_csv} must include columns: {test_game_id_col}, {test_fold_col}. missing={miss}"
+        )
+
+    fold_series = pd.to_numeric(fold_df[test_fold_col], errors="coerce")
+    gid_series = pd.to_numeric(fold_df[test_game_id_col], errors="coerce")
+    mask = fold_series == int(test_fold_value)
+    excluded |= set(gid_series[mask].dropna().astype(int).tolist())
+    return excluded
 
 
 # 기능: 경기 단위 VI/IO/ID 합성 피처(team_game)를 구축한다.
@@ -870,9 +1079,13 @@ def _estimate_lambdas_from_results(
     match_points: pd.DataFrame,
     estimator: str,
     min_games: int,
-) -> tuple[dict[str, float] | None, pd.DataFrame]:
+    scaler_type: str,
+    target_mode: str,
+) -> tuple[dict[str, float] | None, pd.DataFrame, dict | None]:
     train = team_game.merge(match_points, on=["game_id", "team_id"], how="inner")
     train = train[["game_id", "team_id", "vi_game", "io_game", "id_game", "points", "is_win"]].dropna().copy()
+    train["wdl"] = np.where(train["points"] >= 2.5, "W", np.where(train["points"] >= 0.5, "D", "L"))
+    train["wdl_code"] = train["wdl"].map({"L": -1.0, "D": 0.0, "W": 1.0}).astype(float)
 
     report_rows: list[dict] = [
         {
@@ -883,25 +1096,93 @@ def _estimate_lambdas_from_results(
     ]
 
     if len(train) < min_games:
-        return None, pd.DataFrame(report_rows)
+        return None, pd.DataFrame(report_rows), None
 
-    x = train[["vi_game", "io_game", "id_game"]].to_numpy(dtype=float)
+    x_raw = train[["vi_game", "io_game", "id_game"]].to_numpy(dtype=float)
+    if scaler_type == "standard":
+        scaler = StandardScaler()
+        x = scaler.fit_transform(x_raw)
+        scales = np.asarray(scaler.scale_, dtype=float)
+        scales[~np.isfinite(scales) | (np.abs(scales) <= 1e-12)] = 1.0
+        means = np.asarray(scaler.mean_, dtype=float)
+        scaler_stats = {
+            "scaler_type": "standard",
+            "feature_order": ["vi_game", "io_game", "id_game"],
+            "feature_stats": {
+                "vi_game": {"mean": float(means[0]), "scale": float(scales[0]), "std": float(scales[0])},
+                "io_game": {"mean": float(means[1]), "scale": float(scales[1]), "std": float(scales[1])},
+                "id_game": {"mean": float(means[2]), "scale": float(scales[2]), "std": float(scales[2])},
+            },
+        }
+    elif scaler_type == "minmax":
+        scaler = MinMaxScaler()
+        x = scaler.fit_transform(x_raw)
+        data_min = np.asarray(scaler.data_min_, dtype=float)
+        data_max = np.asarray(scaler.data_max_, dtype=float)
+        ranges = np.asarray(scaler.data_range_, dtype=float)
+        ranges[~np.isfinite(ranges) | (np.abs(ranges) <= 1e-12)] = 1.0
+        scaler_stats = {
+            "scaler_type": "minmax",
+            "feature_order": ["vi_game", "io_game", "id_game"],
+            "feature_stats": {
+                "vi_game": {"min": float(data_min[0]), "max": float(data_max[0]), "scale": float(ranges[0])},
+                "io_game": {"min": float(data_min[1]), "max": float(data_max[1]), "scale": float(ranges[1])},
+                "id_game": {"min": float(data_min[2]), "max": float(data_max[2]), "scale": float(ranges[2])},
+            },
+        }
+    else:
+        med = np.nanmedian(x_raw, axis=0)
+        q25 = np.nanpercentile(x_raw, 25.0, axis=0)
+        q75 = np.nanpercentile(x_raw, 75.0, axis=0)
+        iqr = q75 - q25
+        iqr = np.where(np.isfinite(iqr) & (np.abs(iqr) > 1e-12), iqr, 1.0)
+        x = (x_raw - med) / iqr
+        scaler_stats = {
+            "scaler_type": "robust",
+            "feature_order": ["vi_game", "io_game", "id_game"],
+            "feature_stats": {
+                "vi_game": {"median": float(med[0]), "q25": float(q25[0]), "q75": float(q75[0]), "scale": float(iqr[0]), "iqr": float(iqr[0])},
+                "io_game": {"median": float(med[1]), "q25": float(q25[1]), "q75": float(q75[1]), "scale": float(iqr[1]), "iqr": float(iqr[1])},
+                "id_game": {"median": float(med[2]), "q25": float(q25[2]), "q75": float(q75[2]), "scale": float(iqr[2]), "iqr": float(iqr[2])},
+            },
+        }
+
+    report_rows[0]["scaler_type"] = scaler_type
     if estimator == "linear":
-        y = train["points"].to_numpy(dtype=float)
+        if target_mode == "wdl":
+            y = train["wdl_code"].to_numpy(dtype=float)
+            target_name = "wdl_code"
+        elif target_mode == "is_win":
+            y = train["is_win"].to_numpy(dtype=float)
+            target_name = "is_win"
+        else:
+            y = train["points"].to_numpy(dtype=float)
+            target_name = "points"
         if np.std(y) == 0:
-            return None, pd.DataFrame(report_rows + [{"status": "no_target_variance"}])
+            return None, pd.DataFrame(report_rows + [{"status": "no_target_variance"}]), scaler_stats
         model = LinearRegression()
         model.fit(x, y)
         coefs = np.asarray(model.coef_, dtype=float)
-        target_name = "points"
     else:
-        y = train["is_win"].to_numpy(dtype=int)
+        if target_mode == "wdl":
+            y = train["wdl"].map({"L": 0, "D": 1, "W": 2}).to_numpy(dtype=int)
+            target_name = "wdl"
+            if np.unique(y).shape[0] < 2:
+                return None, pd.DataFrame(report_rows + [{"status": "no_class_variance"}]), scaler_stats
+            model = LogisticRegression(max_iter=3000, multi_class="multinomial")
+            model.fit(x, y)
+            coef_mat = np.asarray(model.coef_, dtype=float)
+            coefs = np.mean(np.abs(coef_mat), axis=0)
+        else:
+            y = train["is_win"].to_numpy(dtype=int)
+            target_name = "is_win"
+            if np.unique(y).shape[0] < 2:
+                return None, pd.DataFrame(report_rows + [{"status": "no_class_variance"}]), scaler_stats
+            model = LogisticRegression(max_iter=2000)
+            model.fit(x, y)
+            coefs = np.asarray(model.coef_[0], dtype=float)
         if np.unique(y).shape[0] < 2:
-            return None, pd.DataFrame(report_rows + [{"status": "no_class_variance"}])
-        model = LogisticRegression(max_iter=2000)
-        model.fit(x, y)
-        coefs = np.asarray(model.coef_[0], dtype=float)
-        target_name = "is_win"
+            return None, pd.DataFrame(report_rows + [{"status": "no_class_variance"}]), scaler_stats
 
     abs_coefs = np.abs(coefs)
     coef_sum = float(abs_coefs.sum())
@@ -919,6 +1200,7 @@ def _estimate_lambdas_from_results(
             "coef_vi": float(coefs[0]),
             "coef_io": float(coefs[1]),
             "coef_id": float(coefs[2]),
+            "scaler_type": scaler_type,
             "lambda_vi": float(lambdas[0]),
             "lambda_io": float(lambdas[1]),
             "lambda_id": float(lambdas[2]),
@@ -933,6 +1215,7 @@ def _estimate_lambdas_from_results(
             "lambda_id": float(lambdas[2]),
         },
         pd.DataFrame(report_rows),
+        scaler_stats,
     )
 
 
@@ -956,8 +1239,16 @@ def run_phase4(
     max_games: int | None,
     estimate_lambda: bool,
     lambda_estimator: str,
+    lambda_scaler: str,
+    lambda_target: str,
     matches_dir: Path,
+    matches_csv: Path | None,
     min_games_for_lambda: int,
+    lambda_exclude_game_ids: list[int] | None,
+    lambda_test_fold_csv: Path | None,
+    lambda_test_fold_col: str,
+    lambda_test_fold: int | None,
+    lambda_test_game_id_col: str,
 ) -> None:
     vaep, atomic = _load_phase4_inputs(
         vaep_path=vaep_path,
@@ -985,7 +1276,7 @@ def run_phase4(
         min_player_minutes=min_player_minutes,
         low_minutes_policy=low_minutes_policy,
     )
-    io_pair_agg, io_player = _compute_io(
+    io_pair_agg, io_player, io_event_base = _compute_io(
         atomic_enriched=atomic_enriched,
         same_team_minutes=same_team_minutes,
         attack_weight_map=attack_weight_map,
@@ -993,7 +1284,7 @@ def run_phase4(
         min_pair_minutes=min_pair_minutes,
         low_pair_policy=low_pair_policy,
     )
-    id_pair_agg, id_player = _compute_id(
+    id_pair_agg, id_player, id_event_base = _compute_id(
         atomic_enriched=atomic_enriched,
         opp_minutes=opp_minutes,
         defense_weight_map=defense_weight_map,
@@ -1004,6 +1295,8 @@ def run_phase4(
 
     lambda_report = pd.DataFrame()
     team_game_features = pd.DataFrame()
+    lambda_scaler_stats: dict | None = None
+    excluded_lambda_game_ids: set[int] = set()
 
     if estimate_lambda:
         team_game_features = _build_team_game_components(
@@ -1014,12 +1307,41 @@ def run_phase4(
             attack_default_weight=attack_default_weight,
             defense_default_weight=defense_default_weight,
         )
-        match_points = _load_match_points(matches_dir=matches_dir, game_ids=set(team_game_features["game_id"].astype(int)))
-        estimated, lambda_report = _estimate_lambdas_from_results(
+
+        excluded_lambda_game_ids = _resolve_lambda_excluded_game_ids(
+            explicit_game_ids=lambda_exclude_game_ids,
+            test_fold_csv=lambda_test_fold_csv,
+            test_fold_col=lambda_test_fold_col,
+            test_fold_value=lambda_test_fold,
+            test_game_id_col=lambda_test_game_id_col,
+        )
+        if excluded_lambda_game_ids:
+            before_rows = len(team_game_features)
+            team_game_features = team_game_features[
+                ~team_game_features["game_id"].astype(int).isin(excluded_lambda_game_ids)
+            ].copy()
+            print(
+                "[INFO] Lambda leakage guard applied: "
+                f"excluded_games={len(excluded_lambda_game_ids)}, "
+                f"team_game_rows {before_rows} -> {len(team_game_features)}"
+            )
+
+        match_points = _load_match_points(
+            matches_dir=matches_dir,
+            game_ids=set(team_game_features["game_id"].astype(int)),
+            matches_csv=matches_csv,
+        )
+        if excluded_lambda_game_ids:
+            match_points = match_points[
+                ~match_points["game_id"].astype(int).isin(excluded_lambda_game_ids)
+            ].copy()
+        estimated, lambda_report, lambda_scaler_stats = _estimate_lambdas_from_results(
             team_game=team_game_features,
             match_points=match_points,
             estimator=lambda_estimator,
             min_games=min_games_for_lambda,
+            scaler_type=lambda_scaler,
+            target_mode=lambda_target,
         )
         if estimated is not None:
             lambda_vi = float(estimated["lambda_vi"])
@@ -1060,9 +1382,13 @@ def run_phase4(
 
     io_pair_agg.to_parquet(output_dir / "attack_interaction_io.parquet", index=False)
     io_pair_agg.to_csv(output_dir / "attack_interaction_io.csv", index=False)
+    io_event_base.to_parquet(output_dir / "io_event_surfaces_base.parquet", index=False)
+    io_event_base.to_csv(output_dir / "io_event_surfaces_base.csv", index=False)
 
     id_pair_agg.to_parquet(output_dir / "defense_interaction_id.parquet", index=False)
     id_pair_agg.to_csv(output_dir / "defense_interaction_id.csv", index=False)
+    id_event_base.to_parquet(output_dir / "id_event_surfaces_base.parquet", index=False)
+    id_event_base.to_csv(output_dir / "id_event_surfaces_base.csv", index=False)
 
     if not io_matrix.empty:
         io_matrix.to_csv(output_dir / "attack_interaction_io_matrix.csv")
@@ -1077,16 +1403,55 @@ def run_phase4(
     if estimate_lambda:
         if not team_game_features.empty:
             team_game_features.to_csv(output_dir / "lambda_team_game_features.csv", index=False)
+        if excluded_lambda_game_ids:
+            pd.DataFrame({"excluded_game_id": sorted(excluded_lambda_game_ids)}).to_csv(
+                output_dir / "lambda_excluded_game_ids.csv",
+                index=False,
+            )
         if not lambda_report.empty:
             lambda_report.to_csv(output_dir / "lambda_estimation_report.csv", index=False)
+        if lambda_scaler_stats is not None:
+            pd.DataFrame([
+                {
+                    "scaler_type": str(lambda_scaler_stats.get("scaler_type", "")),
+                    "vi_mean": float(lambda_scaler_stats["feature_stats"]["vi_game"].get("mean", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "vi_scale": float(lambda_scaler_stats["feature_stats"]["vi_game"].get("scale", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "vi_median": float(lambda_scaler_stats["feature_stats"]["vi_game"].get("median", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "vi_q25": float(lambda_scaler_stats["feature_stats"]["vi_game"].get("q25", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "vi_q75": float(lambda_scaler_stats["feature_stats"]["vi_game"].get("q75", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "io_mean": float(lambda_scaler_stats["feature_stats"]["io_game"].get("mean", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "io_scale": float(lambda_scaler_stats["feature_stats"]["io_game"].get("scale", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "io_median": float(lambda_scaler_stats["feature_stats"]["io_game"].get("median", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "io_q25": float(lambda_scaler_stats["feature_stats"]["io_game"].get("q25", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "io_q75": float(lambda_scaler_stats["feature_stats"]["io_game"].get("q75", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "id_mean": float(lambda_scaler_stats["feature_stats"]["id_game"].get("mean", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "id_scale": float(lambda_scaler_stats["feature_stats"]["id_game"].get("scale", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "id_median": float(lambda_scaler_stats["feature_stats"]["id_game"].get("median", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "id_q25": float(lambda_scaler_stats["feature_stats"]["id_game"].get("q25", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "id_q75": float(lambda_scaler_stats["feature_stats"]["id_game"].get("q75", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "vi_min": float(lambda_scaler_stats["feature_stats"]["vi_game"].get("min", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "vi_max": float(lambda_scaler_stats["feature_stats"]["vi_game"].get("max", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "io_min": float(lambda_scaler_stats["feature_stats"]["io_game"].get("min", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "io_max": float(lambda_scaler_stats["feature_stats"]["io_game"].get("max", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "id_min": float(lambda_scaler_stats["feature_stats"]["id_game"].get("min", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                    "id_max": float(lambda_scaler_stats["feature_stats"]["id_game"].get("max", np.nan)) if "feature_stats" in lambda_scaler_stats else np.nan,
+                }
+            ]).to_csv(output_dir / "lambda_scaler_stats.csv", index=False)
+            (output_dir / "lambda_scaler_stats.json").write_text(
+                json.dumps(lambda_scaler_stats, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     print(f"[OK] Saved V_I: {output_dir / 'player_vi.parquet'}")
     print(f"[OK] Saved I_O: {output_dir / 'attack_interaction_io.parquet'}")
+    print(f"[OK] Saved I_O event-base: {output_dir / 'io_event_surfaces_base.parquet'}")
     print(f"[OK] Saved I_D: {output_dir / 'defense_interaction_id.parquet'}")
+    print(f"[OK] Saved I_D event-base: {output_dir / 'id_event_surfaces_base.parquet'}")
     print(f"[OK] Saved final V: {output_dir / 'player_synergy_scores.parquet'}")
     print(
         f"[OK] players={len(player_scores):,}, io_pairs={len(io_pair_agg):,}, "
-        f"id_pairs={len(id_pair_agg):,}, minutes_rows={len(player_minutes):,}"
+        f"id_pairs={len(id_pair_agg):,}, io_events={len(io_event_base):,}, "
+        f"id_events={len(id_event_base):,}, minutes_rows={len(player_minutes):,}"
     )
 
 
@@ -1097,19 +1462,19 @@ def main() -> None:
     parser.add_argument(
         "--vaep-path",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/vaep/vaep_actions.parquet"),
+        default=DATA_DIR / "vaep/vaep_actions.parquet",
         help="Path to vaep_actions.parquet",
     )
     parser.add_argument(
         "--atomic-phase-path",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/tactics/atomic_actions_with_phase.parquet"),
+        default=DATA_DIR / "tactics/atomic_actions_with_phase.parquet",
         help="Path to atomic_actions_with_phase.parquet",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/synergy"),
+        default=DATA_DIR / "synergy",
         help="Directory to save Phase 4 outputs",
     )
     parser.add_argument("--lambda-vi", type=float, default=1.0)
@@ -1154,16 +1519,65 @@ def main() -> None:
         help="Regression model for lambda estimation",
     )
     parser.add_argument(
+        "--lambda-scaler",
+        choices=["standard", "minmax", "robust"],
+        default="robust",
+        help="Feature scaler applied before lambda regression",
+    )
+    parser.add_argument(
+        "--lambda-target",
+        choices=["wdl", "points", "is_win"],
+        default="wdl",
+        help="Target for lambda regression; use wdl to align with GA setup",
+    )
+    parser.add_argument(
         "--matches-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/archive"),
+        default=DATA_DIR / "archive",
         help="Directory containing matches_*.csv",
+    )
+    parser.add_argument(
+        "--matches-csv",
+        type=Path,
+        default=DATA_DIR / "archive/matches_non_england.csv",
+        help="Optional single matches csv for lambda training split (recommended: matches_non_england.csv)",
     )
     parser.add_argument(
         "--min-games-for-lambda",
         type=int,
         default=100,
         help="Minimum team-game samples required for lambda estimation",
+    )
+    parser.add_argument(
+        "--lambda-exclude-game-ids",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Optional explicit game_id list to exclude from lambda estimation (test fold games)",
+    )
+    parser.add_argument(
+        "--lambda-test-fold-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV that maps game_id to fold index",
+    )
+    parser.add_argument(
+        "--lambda-test-fold-col",
+        type=str,
+        default="fold",
+        help="Fold column name in --lambda-test-fold-csv",
+    )
+    parser.add_argument(
+        "--lambda-test-fold",
+        type=int,
+        default=None,
+        help="Target test fold index to exclude when estimating lambda",
+    )
+    parser.add_argument(
+        "--lambda-test-game-id-col",
+        type=str,
+        default="game_id",
+        help="Game id column name in --lambda-test-fold-csv",
     )
 
     args = parser.parse_args()
@@ -1186,8 +1600,16 @@ def main() -> None:
         max_games=args.max_games,
         estimate_lambda=args.estimate_lambda,
         lambda_estimator=args.lambda_estimator,
+        lambda_scaler=args.lambda_scaler,
+        lambda_target=args.lambda_target,
         matches_dir=args.matches_dir,
+        matches_csv=args.matches_csv,
         min_games_for_lambda=args.min_games_for_lambda,
+        lambda_exclude_game_ids=args.lambda_exclude_game_ids,
+        lambda_test_fold_csv=args.lambda_test_fold_csv,
+        lambda_test_fold_col=args.lambda_test_fold_col,
+        lambda_test_fold=args.lambda_test_fold,
+        lambda_test_game_id_col=args.lambda_test_game_id_col,
     )
 
 

@@ -11,6 +11,13 @@ from typing import Iterable
 
 import pandas as pd
 
+PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
+DATA_DIR = PROJECT_ROOT / "data"
+
+
+FIELD_LENGTH = 105.0
+FIELD_WIDTH = 68.0
+
 
 PERIOD_MAP = {
     "1H": 1,
@@ -93,6 +100,15 @@ def _load_players(data_dir: Path) -> pd.DataFrame:
     if players.empty:
         raise RuntimeError(f"Players file is empty: {players_path}")
     return players
+
+
+def _extract_goalkeeper_ids(players: pd.DataFrame) -> set[int]:
+    if players.empty or "wyId" not in players.columns:
+        return set()
+    role_col = players["role"].astype(str) if "role" in players.columns else pd.Series("", index=players.index)
+    gk_mask = role_col.str.contains("'CODE2': 'GK'|\"CODE2\": \"GK\"", regex=True, na=False)
+    ids = pd.to_numeric(players.loc[gk_mask, "wyId"], errors="coerce").dropna().astype(int)
+    return set(ids.tolist())
 
 
 # 기능: Wyscout 이벤트 컬럼을 socceraction 변환 입력 스키마로 정규화한다.
@@ -255,6 +271,7 @@ def convert_league(
     league: str,
     save_csv: bool,
     enforce_ltr: bool,
+    goalkeeper_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     events_path = _find_input_file(data_dir, f"events_{league}")
     matches_path = _find_input_file(data_dir, f"matches_{league}")
@@ -278,6 +295,67 @@ def convert_league(
         raise ValueError(f"{events_path} is missing '{game_id_col}' column")
 
     spadl_frames = []
+
+    def _align_team_direction_per_game(actions_df: pd.DataFrame) -> pd.DataFrame:
+        """Align each team's own-goal side to x=0 using keeper restart/action seeds.
+
+        This fixes occasional Wyscout coordinate inconsistencies where an entire team
+        in a game appears mirrored after conversion.
+        """
+        if actions_df.empty:
+            return actions_df
+
+        named = spadl.add_names(actions_df.copy())
+        out = named.copy()
+        keeper_types = {"keeper_save", "keeper_claim", "keeper_punch", "keeper_pick_up"}
+
+        for team_id, idx in out.groupby("team_id").groups.items():
+            team_rows = out.loc[idx]
+
+            goalkick_seed = team_rows[team_rows["type_name"] == "goalkick"]
+            keeper_seed = team_rows[team_rows["type_name"].isin(list(keeper_types))]
+
+            seed = goalkick_seed if len(goalkick_seed) >= 1 else keeper_seed
+            if len(seed) < 1:
+                continue
+
+            seed_x = pd.to_numeric(seed["start_x"], errors="coerce")
+            if seed_x.isna().all():
+                continue
+
+            own_left = float(seed_x.median()) <= (FIELD_LENGTH / 2.0)
+
+            # If defensive-action seed is mostly on the right half, mirror this team.
+            if float(seed_x.median()) > (FIELD_LENGTH / 2.0 + 5.0):
+                out.loc[idx, "start_x"] = FIELD_LENGTH - pd.to_numeric(out.loc[idx, "start_x"], errors="coerce")
+                out.loc[idx, "end_x"] = FIELD_LENGTH - pd.to_numeric(out.loc[idx, "end_x"], errors="coerce")
+                out.loc[idx, "start_y"] = FIELD_WIDTH - pd.to_numeric(out.loc[idx, "start_y"], errors="coerce")
+                out.loc[idx, "end_y"] = FIELD_WIDTH - pd.to_numeric(out.loc[idx, "end_y"], errors="coerce")
+                # Re-evaluate team rows after full-team flip.
+                team_rows = out.loc[idx]
+                own_left = True
+
+            # Event-level cleanup for GK players: mirror only opposite-half GK actions.
+            team_rows = out.loc[idx]
+            gk_type_mask = team_rows["type_name"].isin(list(keeper_types))
+            gk_player_mask = pd.Series(False, index=team_rows.index)
+            if goalkeeper_ids:
+                gk_player_mask = team_rows["player_id"].astype("Int64").isin(list(goalkeeper_ids))
+
+            if own_left:
+                wrong_side = (gk_type_mask | gk_player_mask) & (pd.to_numeric(team_rows["start_x"], errors="coerce") > (FIELD_LENGTH / 2.0))
+            else:
+                wrong_side = (gk_type_mask | gk_player_mask) & (pd.to_numeric(team_rows["start_x"], errors="coerce") < (FIELD_LENGTH / 2.0))
+
+            wrong_idx = wrong_side[wrong_side].index
+            if len(wrong_idx) > 0:
+                out.loc[wrong_idx, "start_x"] = FIELD_LENGTH - pd.to_numeric(out.loc[wrong_idx, "start_x"], errors="coerce")
+                out.loc[wrong_idx, "end_x"] = FIELD_LENGTH - pd.to_numeric(out.loc[wrong_idx, "end_x"], errors="coerce")
+                out.loc[wrong_idx, "start_y"] = FIELD_WIDTH - pd.to_numeric(out.loc[wrong_idx, "start_y"], errors="coerce")
+                out.loc[wrong_idx, "end_y"] = FIELD_WIDTH - pd.to_numeric(out.loc[wrong_idx, "end_y"], errors="coerce")
+
+        return out[actions_df.columns]
+
     for game_id, game_events in events.groupby(game_id_col, sort=False):
         if game_id not in home_teams.index:
             continue
@@ -287,6 +365,8 @@ def convert_league(
 
         if enforce_ltr:
             game_actions = spadl.play_left_to_right(game_actions, home_team_id)
+
+        game_actions = _align_team_direction_per_game(game_actions)
 
         game_actions["game_id"] = game_id
         spadl_frames.append(game_actions)
@@ -317,13 +397,13 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/archive"),
+        default=DATA_DIR / "archive",
         help="Directory with events_* and matches_* files (.csv/.json/.jsonl/.ndjson)",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/spadl"),
+        default=DATA_DIR / "spadl",
         help="Directory to write SPADL output",
     )
     parser.add_argument(
@@ -351,6 +431,7 @@ def main() -> None:
     args = parser.parse_args()
 
     players = _load_players(args.data_dir)
+    goalkeeper_ids = _extract_goalkeeper_ids(players)
     print(f"[INFO] Loaded players: {len(players):,}")
 
     leagues = _iter_leagues(args.data_dir, args.leagues)
@@ -366,6 +447,7 @@ def main() -> None:
             league=league,
             save_csv=args.save_csv,
             enforce_ltr=not args.no_left_to_right,
+            goalkeeper_ids=goalkeeper_ids,
         )
         combined.append(league_df)
         print(f"[OK] {league}: {len(league_df):,} actions")

@@ -24,6 +24,9 @@ import pandas as pd
 
 import socceraction.atomic.spadl as atomic_spadl
 
+PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
+DATA_DIR = PROJECT_ROOT / "data"
+
 
 SHOT_TYPES = {"shot", "shot_freekick", "shot_penalty"}
 
@@ -384,13 +387,13 @@ def main() -> None:
     parser.add_argument(
         "--spadl-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/spadl"),
+        default=DATA_DIR / "spadl",
         help="Directory containing spadl_*.parquet",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/tactics"),
+        default=DATA_DIR / "tactics",
         help="Directory to write Phase 3 outputs",
     )
     parser.add_argument("--leagues", nargs="*", default=None, help="Optional league list")
@@ -399,7 +402,7 @@ def main() -> None:
     parser.add_argument(
         "--vaep-path",
         type=Path,
-        default=Path("/workspace/ai 라인업/데이터/vaep/vaep_actions.parquet"),
+        default=DATA_DIR / "vaep/vaep_actions.parquet",
         help="Optional VAEP actions parquet for VAEP-based success metric",
     )
 
