@@ -44,11 +44,19 @@ DATA_DIR = PROJECT_ROOT / "data"
 # ----------------------------
 # Zone mapping (asymmetric 12)
 # ----------------------------
-# 기능: 피치 좌표 x(0~105), y(0~68)를 임계값 x=[26.25, 52.5, 78.75], y 분할=[3,1,3,5] 규칙으로 0~11 전술 존 인덱스로 변환한다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다. 특히 x 경계값 26.25/52.5/78.75와 y 구간 분할식을 사용한다를 고정 규칙으로 유지한다.
+# 기능: 피치 좌표(x, y)를 비대칭 12존 전술 구역 인덱스(0~11)로 변환한다.
+# 동작/맥락: 공간 VAEP 값을 12D 벡터로 압축하기 위한 공간 분해 함수이다.
+#            비대칭 구조의 근거: 최종 3분의 1(x≥78.75)은 득점 기회가 집중되므로 5개 세부 존으로 분리하고,
+#            중앙(26.25≤x<52.5)은 경유 구역으로 1개 존으로 단순화한다.
+#   구역 배치:
+#     x ∈ [0, 26.25):   y를 3등분 → 존 0, 1, 2
+#     x ∈ [26.25, 52.5): 전폭 단일 → 존 3
+#     x ∈ [52.5, 78.75): y를 3등분 → 존 4, 5, 6
+#     x ∈ [78.75, 105]:  y를 5등분 → 존 7, 8, 9, 10, 11
 # 데이터 입출력:
-#   - Input: x: float, y: float
-#   - Output: int
+#   - Input: x: float — 피치 길이 방향 좌표 (0~105)
+#            y: float — 피치 폭 방향 좌표 (0~68)
+#   - Output: int — 존 인덱스 (0~11)
 def map_to_12_zones(x: float, y: float) -> int:
     """Map pitch coordinate (x,y) to asymmetric 12 tactical zones.
 
@@ -86,11 +94,14 @@ def map_to_12_zones(x: float, y: float) -> int:
     if yy < 4.0 * b:
         return 10
     return 11
-# 기능: _accumulate_zone_vector는 컬럼 'x', 'y'을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다.
+# 기능: 이벤트 DataFrame의 (x, y, value)를 12존으로 분류하여 존별 누적 합산 12D 벡터를 생성한다.
+# 동작/맥락: 각 행의 (x, y) 좌표를 map_to_12_zones로 존 인덱스로 변환하고, value 값을 해당 존에 더한다.
+#            결과 12D 벡터가 공간 분포를 나타내는 노드/엣지 특징의 원천 데이터가 된다.
+#            이후 _safe_density_divide로 exposure_90(경기 수 기반 밀도 정규화)를 적용한다.
 # 데이터 입출력:
-#   - Input: events: pd.DataFrame, value_col: str
-#   - Output: np.ndarray
+#   - Input: events: pd.DataFrame — 'x', 'y', value_col 컬럼 포함 (행: 개별 이벤트)
+#            value_col: str — 누적할 값 컬럼명 (VAEP에선 'offensive_value' 또는 'defensive_value')
+#   - Output: np.ndarray [12] — 존별 누적 VAEP 합계 벡터 (float32)
 def _accumulate_zone_vector(events: pd.DataFrame, value_col: str = "value") -> np.ndarray:
     """Accumulate event values into a 12D zone vector."""
     vec = np.zeros(12, dtype=np.float32)
@@ -110,20 +121,24 @@ def _accumulate_zone_vector(events: pd.DataFrame, value_col: str = "value") -> n
         z = map_to_12_zones(float(xx), float(yy))
         vec[z] += float(vv)
     return vec
-# 기능: _safe_density_divide는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다.
+# 기능: 누적 합산 12D 벡터를 경기 수(exposure_90)로 나눠 per-90 밀도 벡터로 변환한다.
+# 동작/맥락: exposure_90이 0에 가까우면 분모가 1e-6으로 대체하여 ZeroDivisionError를 방지한다.
 # 데이터 입출력:
-#   - Input: vec: np.ndarray, exposure_90: float
-#   - Output: np.ndarray
+#   - Input: vec: np.ndarray [12] — 누적 VAEP 벡터
+#            exposure_90: float — 출전 경기 수 (per-90 밀도 정규화 분모)
+#   - Output: np.ndarray [12] — per-90 정규화된 밀도 벡터 (float32)
 def _safe_density_divide(vec: np.ndarray, exposure_90: float) -> np.ndarray:
     """Convert summed vector into density vector using per-90 exposure."""
     denom = float(max(exposure_90, 1e-6))
     return (vec / denom).astype(np.float32)
-# 기능: OFF/DEF 이벤트의 ['player_id','game_id'] 고유 경기 수를 이용해 분모(exposure_90)를 계산하고 밀도 정규화용 맵을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다. 특히 엔티티 키(game_id/team_id/player_id) 일관성를 고정 규칙으로 유지한다.
+# 기능: 선수별 '출전 경기 수'를 exposure 분모로 계산하여 per-90 밀도 정규화에 사용할 맵을 만든다.
+# 동작/맥락: 출전 경기 수가 많은 선수는 누적 VAEP가 크게 나타나는 경향이 있어,
+#            단순 합계 대신 경기 수로 나눈 per-90 밀도를 노드 특징으로 사용한다.
+#            누적 분 데이터가 없는 경우 unique game_id 수를 대체 분모로 사용 (fallback).
 # 데이터 입출력:
-#   - Input: off_events: pd.DataFrame, def_events: pd.DataFrame
-#   - Output: Dict[int, float]
+#   - Input: off_events: pd.DataFrame — player_id, game_id 포함 (경기 시점 이전 OFF 이벤트)
+#            def_events: pd.DataFrame — player_id, game_id 포함 (경기 시점 이전 DEF 이벤트)
+#   - Output: Dict[int, float] — {player_id: exposure_90분수} (최소값 1.0)
 def _build_player_exposure90(off_events: pd.DataFrame, def_events: pd.DataFrame) -> Dict[int, float]:
     """Build exposure map per player.
 
@@ -157,10 +172,10 @@ def _build_player_exposure90(off_events: pd.DataFrame, def_events: pd.DataFrame)
 # ----------------------------
 # Match / lineup utilities
 # ----------------------------
-# 기능: _to_int는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다.
+# 기능: 임의 타입 값을 int로 변환한다. NaN이거나 변환 불가이면 None을 반환한다.
+# 동작/맥락: CSV에서 읽은 팀 ID / 선수 ID는 float 또는 str일 수 있어 안전한 변환 함수가 필요하다.
 # 데이터 입출력:
-#   - Input: v: object
+#   - Input: v: object — int, float, str, NaN 등 임의 타입
 #   - Output: int | None
 def _to_int(v: object) -> int | None:
     try:
@@ -169,11 +184,12 @@ def _to_int(v: object) -> int | None:
         return int(float(v))
     except Exception:
         return None
-# 기능: _safe_eval_list는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다.
+# 기능: 문자열 또는 리스트 타입 값을 Python 리스트로 안전하게 변환한다.
+# 동작/맥락: 경기 CSV의 formation.lineup 컬럼은 "[{'playerId': ...}, ...]" 형태의 문자열로 저장되어 있어
+#            ast.literal_eval로 파싱해야 한다. 파싱 실패 시 빈 리스트를 반환한다.
 # 데이터 입출력:
-#   - Input: v: object
-#   - Output: list
+#   - Input: v: object — list, str(JSON-like), 또는 기타
+#   - Output: list — 파싱 성공 시 리스트, 실패 시 []
 def _safe_eval_list(v: object) -> list:
     if isinstance(v, list):
         return v
@@ -255,11 +271,11 @@ def _pick_best_parquet_by_overlap(candidates: List[Path], match_ids: Set[int], k
     if best_path is None:
         raise FileNotFoundError(f"No readable parquet among candidates: {candidates}")
     return best_path
-# 기능: _pick_first_existing_path는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다.
+# 기능: 후보 경로 리스트에서 실제로 존재하는 첫 번째 경로를 반환한다.
+# 동작/맥락: IO/ID parquet 파일이 여러 디렉토리 중 하나에 있을 수 있어 우선순위 기반 경로 선택에 사용한다.
 # 데이터 입출력:
-#   - Input: candidates: List[Path]
-#   - Output: Path
+#   - Input: candidates: List[Path] — 우선순위 순으로 정렬된 경로 리스트
+#   - Output: Path — 첫 번째로 존재하는 경로, 없으면 FileNotFoundError
 def _pick_first_existing_path(candidates: List[Path]) -> Path:
     """Return the first existing path from a candidate list."""
     for candidate in candidates:
@@ -437,11 +453,17 @@ def _build_event_tables(data_root: Path, match_ids: Set[int], dataset_hint: str 
 # ----------------------------
 # HeteroData builder
 # ----------------------------
-# 기능: _build_node_feature_matrix는 컬럼 'player_id'을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다. 특히 엔티티 키(game_id/team_id/player_id) 일관성를 고정 규칙으로 유지한다.
+# 기능: 선수 리스트에 대해 24D 노드 특징 행렬 [N_players, 24]를 생성한다.
+# 동작/맥락: 각 선수 노드의 24D 특징: [off_12, def_12] = [공격 공간 VAEP 12존 벡터, 수비 공간 VAEP 12존 벡터]
+#            - off_12: 해당 선수가 과거 경기에서 생성한 공격 VAEP를 존별로 누적 후 per-90 밀도로 정규화
+#            - def_12: 해당 선수가 과거 경기에서 생성한 수비 VAEP를 존별로 누적 후 per-90 밀도로 정규화
+#            선수 순서: player_ids 리스트 순서 = 그래프에서의 노드 인덱스 순서
 # 데이터 입출력:
-#   - Input: player_ids: List[int], off_events: pd.DataFrame, def_events: pd.DataFrame, exposure90_map: Dict[int, float]
-#   - Output: np.ndarray
+#   - Input: player_ids: List[int] — 11명 선수 ID 리스트 (노드 순서 결정)
+#            off_events: pd.DataFrame — 해당 선수들의 경기 시점 이전 공격 이벤트
+#            def_events: pd.DataFrame — 해당 선수들의 경기 시점 이전 수비 이벤트
+#            exposure90_map: Dict[int, float] — 선수별 per-90 분모 (경기 수)
+#   - Output: np.ndarray [N_players, 24] — float32 노드 특징 행렬
 def _build_node_feature_matrix(
     player_ids: List[int],
     off_events: pd.DataFrame,
@@ -459,11 +481,18 @@ def _build_node_feature_matrix(
     if not feats:
         return np.zeros((0, 24), dtype=np.float32)
     return np.stack(feats, axis=0).astype(np.float32)
-# 기능: _build_same_team_io_edges는 컬럼 'team_id', 'src_player_id', 'dst_player_id'을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다. 특히 엔티티 키(game_id/team_id/player_id) 일관성를 고정 규칙으로 유지한다.
+# 기능: 같은 팀 선수들 사이의 방향성 IO(패스 협력) 엣지와 12D 엣지 특징을 생성한다.
+# 동작/맥락: IO 엣지는 (src_player → dst_player) 방향 패스 협력 강도를 나타낸다.
+#   - 완전 방향 그래프(complete directed graph): 자기 자신 제외 N×(N-1)개 엣지 (N=11)
+#   - 역사적 이벤트가 없어도 구조적 엣지는 유지하고 12D 영벡터로 채움
+#     (GAT가 일관된 그래프 구조에서 어텐션을 학습하도록)
+#   - 엣지 특징: 해당 (src→dst) 쌍의 과거 IO 이벤트를 12존 누적 후 양방향 exposure_90 평균으로 정규화
 # 데이터 입출력:
-#   - Input: team_id: int, player_ids: List[int], io_events: pd.DataFrame, exposure90_map: Dict[int, float]
-#   - Output: Tuple[np.ndarray, np.ndarray]
+#   - Input: team_id: int — 팀 필터링에 사용
+#            player_ids: List[int] — 11명 선수 ID (노드 인덱스 순서와 동일)
+#            io_events: pd.DataFrame — 경기 시점 이전 IO 이벤트 (src/dst player_id, x, y, value)
+#            exposure90_map: Dict[int, float] — 엣지 per-90 정규화 분모 (src, dst의 평균 사용)
+#   - Output: Tuple[edge_index [2, E], edge_attr [E, 12]] — E = N×(N-1) = 110
 def _build_same_team_io_edges(
     team_id: int,
     player_ids: List[int],
@@ -501,11 +530,19 @@ def _build_same_team_io_edges(
     edge_index = np.array(edges, dtype=np.int64).T if edges else np.zeros((2, 0), dtype=np.int64)
     edge_attr = np.stack(attrs, axis=0).astype(np.float32) if attrs else np.zeros((0, 12), dtype=np.float32)
     return edge_index, edge_attr
-# 기능: _build_cross_id_edges는 컬럼 'defending_team_id', 'opponent_team_id', 'defender_player_id', 'opponent_player_id'을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다.
+# 기능: 수비팀과 공격팀 선수들 사이의 교차 방향 ID(수비 대결) 엣지와 12D 엣지 특징을 생성한다.
+# 동작/맥락: ID 엣지는 (defender_player → opponent_player) 방향 수비 대결 강도를 나타낸다.
+#   - 이분 방향 그래프(bipartite directed graph): def_N × off_N 개 엣지 = 11×11 = 121개
+#   - 매치업 이력이 없어도 구조 엣지 유지, 영벡터 채움 (IO와 동일 철학)
+#   - 엣지 특징: (defender → opponent) 쌍의 과거 수비 대결 이벤트를 12존 누적 후 양측 exposure_90 평균 정규화
+#   - REL_HOME_ID: def_team=home, off_team=away → edge_index의 dst가 away 노드 인덱스
+#   - REL_AWAY_ID: def_team=away, off_team=home → edge_index의 dst가 home 노드 인덱스
 # 데이터 입출력:
-#   - Input: def_team_id: int, def_player_ids: List[int], off_team_id: int, off_player_ids: List[int], id_events: pd.DataFrame, def_exposure90_map: Dict[int, float], ...
-#   - Output: Tuple[np.ndarray, np.ndarray]
+#   - Input: def_team_id, def_player_ids: 수비팀 ID 및 선수 리스트 (11명)
+#            off_team_id, off_player_ids: 공격팀 ID 및 선수 리스트 (11명)
+#            id_events: DataFrame — defending/opponent team_id, player_id, x, y, value
+#            def/off_exposure90_map: 각 팀 선수별 per-90 분모
+#   - Output: Tuple[edge_index [2, 121], edge_attr [121, 12]]
 def _build_cross_id_edges(
     def_team_id: int,
     def_player_ids: List[int],
@@ -549,7 +586,7 @@ def _build_cross_id_edges(
     edge_index = np.array(edges, dtype=np.int64).T if edges else np.zeros((2, 0), dtype=np.int64)
     edge_attr = np.stack(attrs, axis=0).astype(np.float32) if attrs else np.zeros((0, 12), dtype=np.float32)
     return edge_index, edge_attr
-# 기능: home/away 11인 기준 node(24D=off_12+def_12)와 edge(IO/ID 12D) 텐서를 구성하고 match_y/global_features를 포함한 HeteroData를 만든다.
+# 기능: home/away 11인 기준 node(24D=off_12+def_12)와 edge(IO/ID 12D) 텐서를 구성하고 match_y를 포함한 HeteroData를 만든다.
 # 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다. 특히 엔티티 키(game_id/team_id/player_id) 일관성를 고정 규칙으로 유지한다.
 # 데이터 입출력:
 #   - Input: match_id: int, past_events_df: Dict[str, pd.DataFrame], matches_df: pd.DataFrame, players_per_team: int
@@ -677,20 +714,6 @@ def create_match_heterodata(
     data["home_player_ids"] = torch.tensor(home_lineup, dtype=torch.long)
     data["away_player_ids"] = torch.tensor(away_lineup, dtype=torch.long)
 
-    # Graph-level context features injected for downstream model (global_features).
-    # Keep this leakage-safe: no post-match outcomes are used.
-    match_time = row.get("match_time", pd.NaT)
-    if pd.notna(match_time):
-        ts = pd.Timestamp(match_time)
-        month = float(ts.month)
-        dow = float(ts.dayofweek)
-        month_rad = 2.0 * np.pi * (month - 1.0) / 12.0
-        is_weekend = 1.0 if int(dow) >= 5 else 0.0
-        global_features = np.array([1.0, is_weekend, np.sin(month_rad), np.cos(month_rad)], dtype=np.float32)
-    else:
-        global_features = np.array([1.0, 0.0, 0.0, 1.0], dtype=np.float32)
-    data["global_features"] = torch.tensor(global_features, dtype=torch.float32)
-
     return data
 
 
@@ -718,11 +741,18 @@ def _parse_match_time(matches_df: pd.DataFrame) -> pd.DataFrame:
     out["match_time_unix"] = (out["match_time"].astype("int64") // 1_000_000_000).astype(np.int64)
     out["seq_index"] = np.arange(len(out), dtype=np.int64)
     return out
-# 기능: 각 타깃 경기마다 과거 경기 집합(past_id_set)을 만들고 OFF/DEF/IO/ID를 game_id 기준으로 잘라 rolling-window HeteroData를 생성한다.
-# 동작/맥락: Phase4.5 그래프 생성에서 경기 시점 이전(match_time_unix < cur_unix) 데이터만 사용해 시계열 누수를 차단하기 위해 필요하다. 특히 경기 키('wyId')와 시점 컬럼('dateutc'/'match_time') 정합성; 엔티티 키(game_id/team_id/player_id) 일관성; 현재 경기보다 과거(match_time_unix < cur_unix) 조건만 남긴다를 고정 규칙으로 유지한다.
+# 기능: 각 타깃 경기마다 경기 시점(match_time) 이전의 과거 기록만 사용하여 HeteroData를 생성한다.
+# 동작/맥락: 시계열 누수(temporal leakage) 방지를 위해 엄격한 rolling window를 적용한다:
+#   ① 타깃 경기 m의 unix 타임스탬프 cur_unix를 추출
+#   ② match_time_unix < cur_unix 조건으로 과거 경기 ID 집합(past_id_set) 구성
+#   ③ OFF/DEF/IO/ID 이벤트를 game_id ∈ past_id_set 로 필터링
+#   ④ 필터링된 이벤트로 create_match_heterodata 호출 → HeteroData 생성
+#   - 최초 경기들은 과거 기록이 거의 없어 특징이 0에 가까울 수 있지만, 이것은 데이터에 실제로 반영된 정보량이다.
 # 데이터 입출력:
-#   - Input: matches_df: pd.DataFrame, event_tables: EventTables, players_per_team: int
-#   - Output: Tuple[List[HeteroData], pd.DataFrame]
+#   - Input: matches_df: pd.DataFrame — _parse_match_time() 처리된 경기 테이블 (match_time_unix 컬럼 포함)
+#            event_tables: EventTables — OFF/DEF/IO/ID 전체 이벤트 (내부에서 rolling window 필터링)
+#            players_per_team: int — 팀당 선수 수 (기본값 11)
+#   - Output: Tuple[List[HeteroData], pd.DataFrame(메타 정보)] — 그래프 생성 실패 경기는 메타에 error 기록
 def build_rolling_gnn_dataset(
     matches_df: pd.DataFrame,
     event_tables: EventTables,
