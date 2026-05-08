@@ -12,7 +12,6 @@ What this script does:
 """
 
 import argparse
-import ast
 import importlib.util
 import json
 import random
@@ -28,22 +27,13 @@ import torch
 PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
 DATA_DIR = PROJECT_ROOT / "data"
 PROPOSED_DIR = PROJECT_ROOT / "proposed_spatial_gnn_ga"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(PROPOSED_DIR) not in sys.path:
     sys.path.insert(0, str(PROPOSED_DIR))
 
 import optimize_lineup_ga_phase6 as p6
-# 기능: _to_int는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: v: object
-#   - Output: int | None
-def _to_int(v: object) -> int | None:
-    try:
-        if pd.isna(v):
-            return None
-        return int(float(v))
-    except Exception:
-        return None
+from utils import _safe_literal, _to_int  # noqa: E402
 # 기능: _safe_eval_list는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다.
 # 데이터 입출력:
@@ -112,11 +102,13 @@ def _extract_players_from_formation_blob(raw_formation: object, key: str) -> Lis
     if not isinstance(parsed, dict):
         return []
     return _extract_player_ids(parsed.get(key), max_take=None)
-# 기능: _extract_matchday_squad는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다.
+# 기능: 경기 행에서 특정 팀의 실제 경기 등록 선수단(선발 11명 + 벤치)을 추출한다.
+# 동작/맥락: GA는 실제 경기 명단에 있는 선수들만 후보로 사용해야 한다 (available_player_ids 제약).
+#            컬럼 우선순위: team*.formation.lineup/bench 직접 컬럼 → team*.formation 중첩 blob → substitutions fallback
 # 데이터 입출력:
-#   - Input: row: dict, side_prefix: str
-#   - Output: List[int]
+#   - Input: row: dict — 경기 DataFrame 한 행 (team1.* 또는 team2.* 컬럼 포함)
+#            side_prefix: str — "team1" 또는 "team2"
+#   - Output: List[int] — 선발 + 벤치 player_id 리스트 (중복 제거, 최대 18명)
 def _extract_matchday_squad(row: dict, side_prefix: str) -> List[int]:
     # Prefer explicit columns, then fallback to nested formation blob.
     lineup = _extract_player_ids(row.get(f"{side_prefix}.formation.lineup"), max_take=11)
@@ -164,25 +156,6 @@ def _parse_role_code(role_value: object) -> str | None:
             if code in txt:
                 return code
     return None
-# 기능: _safe_literal는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: value
-#   - Output: 코드 내부 return 표현식
-def _safe_literal(value):
-    if isinstance(value, (list, dict)):
-        return value
-    if pd.isna(value):
-        return None
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return ast.literal_eval(text)
-    except (SyntaxError, ValueError):
-        return None
 # 기능: _build_player_position_map는 연산 pd.read_csv을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다.
 # 데이터 입출력:
@@ -203,11 +176,14 @@ def _build_player_position_map(players_csv: Path) -> Dict[int, str]:
         if code in {"GK", "DF", "MF", "FW"}:
             pos_map[int(pid)] = str(code)
     return pos_map
-# 기능: _infer_formation_from_lineup는 컬럼 'GK', 'DF', 'MF', 'FW'을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다.
+# 기능: 11인 라인업 ID 리스트와 포지션 맵으로 Team-Builder에 입력할 포메이션 문자열("4-3-3" 등)을 추론한다.
+# 동작/맥락: Team-Builder는 포메이션을 명시적으로 입력받으므로 GNN GA 결과 라인업의 포지션 분포를 분석해
+#            DF-MF-FW 카운트로 포메이션을 생성한다. GK 1명 제외 후 나머지 10명으로 계산한다.
 # 데이터 입출력:
-#   - Input: lineup_ids: Sequence[int], player_position_map: Dict[int, str], fallback: str
-#   - Output: str
+#   - Input: lineup_ids: Sequence[int] — 11인 player_id
+#            player_position_map: Dict[int, str] — {player_id: 'GK'/'DF'/'MF'/'FW'}
+#            fallback: str — 포지션 정보 불충분 시 기본 포메이션 (예: "4-3-3")
+#   - Output: str — "DF수-MF수-FW수" 형식 포메이션 문자열
 def _infer_formation_from_lineup(
     lineup_ids: Sequence[int],
     player_position_map: Dict[int, str],
@@ -393,16 +369,22 @@ def _mutate(g: List[int], n_pool: int, p_mut: float, fixed_idx: int | None = Non
             tries += 1
         out[pos] = cand
     return _repair_unique(out, n_pool=n_pool, k=len(g), fixed_idx=fixed_idx)
-# 기능: _run_ga_optimize_home_quiet는 연산 GA 세대 반복, temperature가 반영된 outcome 확률로 expected_points를 계산한다을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다. 특히 temperature가 반영된 outcome 확률로 expected_points를 계산한다를 고정 규칙으로 유지한다.
+# 기능: 배치 실험용 GA 홈팀 최적화 래퍼 — 표준 출력 없이 best genome과 예측 결과만 반환한다.
+# 동작/맥락: run_experiment_batch.py에서는 경기별로 GA를 수백 회 호출하므로 verbose 출력을 억제한다.
+#            run_ga_optimize_home과 동일한 GA 로직이지만 캐시 스케일링 방식이 다르다:
+#            - 여기서는 graph_scaler 없이 캐시가 이미 p6._apply_scaler_to_cache_inplace로 사전 정규화됨
+#            - (optimize_lineup_ga_phase6.py main()은 graph 단위 정규화 사용 — 동일 수학적 결과)
 # 데이터 입출력:
-#   - Input: model, cache: p6.MatchupCache, away_sel: List[int], global_features: torch.Tensor, device: torch.device, pop_size: int, ...
-#   - Output: Tuple[List[int], p6.OutcomePrediction]
+#   - Input: model, cache: p6.MatchupCache, away_sel: List[int], device: torch.device
+#            pop_size, generations, elite_size, mutation_p: GA 하이퍼파라미터
+#            temperature: float — softmax 온도 (기본값 2.0)
+#            early_stop_patience: int — stale 세대 최대 허용 수
+#            fixed_home_idx: int|None — GK 고정 인덱스
+#   - Output: Tuple[best_genome: List[int], best_pred: p6.OutcomePrediction]
 def _run_ga_optimize_home_quiet(
     model,
     cache: p6.MatchupCache,
     away_sel: List[int],
-    global_features: torch.Tensor,
     device: torch.device,
     pop_size: int,
     generations: int,
@@ -425,7 +407,7 @@ def _run_ga_optimize_home_quiet(
         improved = False
         scored = []
         for g in pop:
-            data = p6.build_fast_heterodata(cache, home_sel=g, away_sel=away_sel, global_features=global_features)
+            data = p6.build_fast_heterodata(cache, home_sel=g, away_sel=away_sel)
             pred = p6._predict_home_outcome_probs(model, data, device=device, temperature=float(temperature))
             fit = float(pred.expected_points)
             scored.append((fit, g, pred))
@@ -456,16 +438,18 @@ def _run_ga_optimize_home_quiet(
         pop = next_pop
 
     return best_g, best_pred
-# 기능: _run_ga_optimize_away_quiet는 연산 GA 세대 반복, temperature가 반영된 outcome 확률로 expected_points를 계산한다을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다. 특히 temperature가 반영된 outcome 확률로 expected_points를 계산한다를 고정 규칙으로 유지한다.
+# 기능: 배치 실험용 GA 어웨이팀 최적화 래퍼 — 홈팀 시각 예측을 어웨이 시각으로 전환하여 어웨이 기대 승점을 최대화한다.
+# 동작/맥락: 어웨이팀 관점 기대 승점 = 3·P_away_win + P_draw = 3·P_home_loss + P_draw
+#            모델은 항상 홈팀 관점으로 예측하므로 p6._to_away_outcome_prediction()으로 확률을 뒤집어 사용한다.
 # 데이터 입출력:
-#   - Input: model, cache: p6.MatchupCache, home_sel: List[int], global_features: torch.Tensor, device: torch.device, pop_size: int, ...
-#   - Output: Tuple[List[int], p6.OutcomePrediction]
+#   - Input: model, cache: p6.MatchupCache, home_sel: List[int], device: torch.device
+#            pop_size, generations, elite_size, mutation_p: GA 하이퍼파라미터
+#            temperature, early_stop_patience, fixed_away_idx: 동일 의미
+#   - Output: Tuple[best_genome: List[int], best_pred: p6.OutcomePrediction] (어웨이 관점)
 def _run_ga_optimize_away_quiet(
     model,
     cache: p6.MatchupCache,
     home_sel: List[int],
-    global_features: torch.Tensor,
     device: torch.device,
     pop_size: int,
     generations: int,
@@ -488,7 +472,7 @@ def _run_ga_optimize_away_quiet(
         improved = False
         scored = []
         for g in pop:
-            data = p6.build_fast_heterodata(cache, home_sel=home_sel, away_sel=g, global_features=global_features)
+            data = p6.build_fast_heterodata(cache, home_sel=home_sel, away_sel=g)
             home_pred = p6._predict_home_outcome_probs(model, data, device=device, temperature=float(temperature))
             away_pred = p6._to_away_outcome_prediction(home_pred)
             fit = float(away_pred.expected_points)
@@ -541,11 +525,19 @@ def _clear_teambuilder_outputs(run_dir: Path) -> None:
         p = run_dir / name
         if p.exists():
             p.unlink()
-# 기능: _run_teambuilder_once는 컬럼 'player_id', 연산 pd.read_csv, lambda_vi/lambda_io/lambda_id 선형 결합 목적함수를 사용한다을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다. 특히 엔티티 키(game_id/team_id/player_id) 일관성; lambda_vi/lambda_io/lambda_id 선형 결합 목적함수를 사용한다를 고정 규칙으로 유지한다.
+# 기능: Team-Builder(ILP 기반 라인업 최적화)를 1회 실행하고 선택된 11인 player_id 리스트를 반환한다.
+# 동작/맥락: Team-Builder는 GNN-GA와 비교 대조군이다. 목적함수:
+#            max λ_vi·V_i + λ_io·IO_ij + λ_id·ID_ij  (ILP)
+#            실행 전 _clear_teambuilder_outputs으로 이전 결과를 삭제하여 덮어쓰기 충돌을 방지한다.
+#            실행 후 lineup_selected.csv에서 player_id 11개를 읽어 반환한다.
 # 데이터 입출력:
-#   - Input: tb_mod, run_dir: Path, synergy_dir: Path, tactics_dir: Path, archive_dir: Path, team_id: int, ...
-#   - Output: List[int]
+#   - Input: tb_mod — 동적 로드된 Team-Builder 모듈
+#            run_dir: Path — 이번 경기용 임시 출력 디렉토리
+#            synergy_dir, tactics_dir, archive_dir: Path — 데이터 소스 경로
+#            team_id, formation, lambda_vi/io/id, solver_time_limit: 최적화 파라미터
+#            opponent_lineup_ids: List[int] — GNN GA 결과로 얻은 상대팀 11인 (condition 제공)
+#            available_player_ids: List[int] — 실제 경기 명단 (후보 제한)
+#   - Output: List[int] — 선택된 11인 player_id 리스트
 def _run_teambuilder_once(
     tb_mod,
     run_dir: Path,
@@ -629,11 +621,22 @@ def _team_name_map(teams_csv: Path) -> Dict[int, str]:
             continue
         out[int(tid)] = str(r.name)
     return out
-# 기능: 배치 입력 경기들을 순회하며 GNN/Team-Builder 양쪽 예측 CSV 및 오류 CSV를 저장하고 필요시 외부 evaluator를 서브프로세스로 호출한다.
-# 동작/맥락: 380경기 배치 실험에서 GNN/Team-Builder를 동일 조건으로 실행하고 비교 지표 CSV를 재현 가능하게 만들기 위해 필요하다. 특히 경기 키('wyId')와 시점 컬럼('dateutc'/'match_time') 정합성; lambda_vi/lambda_io/lambda_id 선형 결합 목적함수를 사용한다를 고정 규칙으로 유지한다.
+# 기능: 전체 실험 배치를 실행한다. 매 경기마다 GNN-GA와 Team-Builder를 모두 실행하고 예측 CSV를 저장한다.
+# 동작/맥락: 전체 실험 흐름:
+#   ① matches_csv(EPL 17/18 기본 380경기) 로드 → 시간순 정렬
+#   ② GNN 모델 + feature scaler 로드 (체크포인트에서 복원)
+#   ③ Team-Builder 모듈 동적 로드 (--skip-teambuilder이면 생략)
+#   ④ 경기별 루프:
+#      a. build_matchup_cache → 경기 시점 이전 기록으로 MatchupCache 생성
+#      b. p6._apply_scaler_to_cache_inplace → 캐시 전체를 z-score 정규화
+#      c. GA 홈팀 최적화: _run_ga_optimize_home_quiet → best_home_xi, home_pred
+#      d. GA 어웨이팀 최적화: _run_ga_optimize_away_quiet → best_away_xi, away_pred
+#      e. Team-Builder 홈/어웨이 각각 실행 (ILP 기반 라인업 선택)
+#      f. 결과를 gnn_predictions.csv, teambuilder_predictions.csv에 누적 저장
+#   ⑤ 전체 경기 완료 후 외부 evaluator 서브프로세스 호출 (--evaluator 경로)
 # 데이터 입출력:
-#   - Input: args: argparse.Namespace
-#   - Output: None
+#   - Input: args: argparse.Namespace — CLI 파라미터 (matches-csv, model-ckpt 등)
+#   - Output: None (CSV 파일들이 output-dir에 저장됨)
 def run(args: argparse.Namespace) -> None:
     random.seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -764,7 +767,6 @@ def run(args: argparse.Namespace) -> None:
                     available_away_player_ids=away_matchday,
                 )
                 p6._apply_scaler_to_cache_inplace(cache, scaler)
-                gf = p6._build_global_features(match_time)
 
                 fixed_home_gk_idx = p6.resolve_fixed_gk_index(
                     team_cache=cache.home,
@@ -783,7 +785,6 @@ def run(args: argparse.Namespace) -> None:
                     model=model,
                     cache=cache,
                     away_sel=fixed_away_sel,
-                    global_features=gf,
                     device=device,
                     pop_size=int(args.gnn_pop_size),
                     generations=int(args.gnn_generations),
@@ -801,7 +802,6 @@ def run(args: argparse.Namespace) -> None:
                     model=model,
                     cache=cache,
                     home_sel=fixed_home_sel,
-                    global_features=gf,
                     device=device,
                     pop_size=int(args.gnn_pop_size),
                     generations=int(args.gnn_generations),

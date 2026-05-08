@@ -16,8 +16,8 @@ Tactic weighting:
 from __future__ import annotations
 
 import argparse
-import ast
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +26,9 @@ import pulp
 
 PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
 DATA_DIR = PROJECT_ROOT / "data"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from utils import _safe_literal  # noqa: E402
 # 기능: _resolve_synergy_file는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: Phase5 Team-Builder ILP 단계에서 목적함수 V=lambda1*V_I + lambda2*I_O + lambda3*I_D를 구성/최적화하기 위해 필요하다.
 # 데이터 입출력:
@@ -73,25 +76,6 @@ def _load_player_synergy_scores(synergy_dir: Path) -> pd.DataFrame:
 
     print(f"[INFO] loaded player synergy scores: {src} rows={len(df)}")
     return df
-# 기능: _safe_literal는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase5 Team-Builder ILP 단계에서 목적함수 V=lambda1*V_I + lambda2*I_O + lambda3*I_D를 구성/최적화하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: value
-#   - Output: 코드 내부 return 표현식
-def _safe_literal(value):
-    if isinstance(value, (list, dict)):
-        return value
-    if pd.isna(value):
-        return None
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return ast.literal_eval(text)
-    except (SyntaxError, ValueError):
-        return None
 # 기능: _parse_role_code는 컬럼 'code2', 'name'을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: Phase5 Team-Builder ILP 단계에서 목적함수 V=lambda1*V_I + lambda2*I_O + lambda3*I_D를 구성/최적화하기 위해 필요하다.
 # 데이터 입출력:

@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import pickle
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -21,24 +21,9 @@ from socceraction.vaep.base import xfns_default
 
 PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
 DATA_DIR = PROJECT_ROOT / "data"
-
-
-# 기능: 문자열 기반 리스트/딕셔너리를 안전하게 파싱해 후속 컬럼 추출 오류를 방지한다.
-# 동작/맥락: matches의 teamsData 등 JSON 유사 텍스트를 ast로 해석하며 실패 시 None 반환.
-def _safe_literal(value):
-    if isinstance(value, (dict, list)):
-        return value
-    if pd.isna(value):
-        return None
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return ast.literal_eval(text)
-    except (ValueError, SyntaxError):
-        return None
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from utils import _safe_literal  # noqa: E402
 
 
 # 기능: csv/json/jsonl 입력을 통합 로더로 DataFrame화한다.

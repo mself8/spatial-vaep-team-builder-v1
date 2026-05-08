@@ -106,12 +106,6 @@ Train the model:
 python proposed_spatial_gnn_ga/train_gnn_phase5.py
 ```
 
-For multi-GPU training:
-
-```bash
-python proposed_spatial_gnn_ga/train_gnn_phase5_multigpu.py
-```
-
 Run GA-based lineup optimization:
 
 ```bash
@@ -139,4 +133,5 @@ python evaluation_comparison/evaluate_hitrate_gnn_vs_teambuilder.py \
 - `io_event_surfaces_base.parquet` and `id_event_surfaces_base.parquet` are raw event logs, not spatial tensors.
 - The 12-zone tensors are built inside `proposed_spatial_gnn_ga/build_gnn_dataset_phase4_5.py`.
 - The baseline Team-Builder is a scalar ILP model, not the spatial GNN branch.
-- `deprecated_legacy/` contains older transitional code kept for reference only.
+- `baseline_teambuilder/optimize_lineup_phase5_ga.py` implements the paper Table 2 ablation "Ours (Without GNN)" — Team-Builder objective optimized via GA.
+- Shared parsing helpers (`_safe_literal`, `_to_int`) live in `utils.py` and are imported by individual scripts.

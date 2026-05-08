@@ -38,6 +38,9 @@ from torch_geometric.nn import global_mean_pool
 
 PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
 DATA_DIR = PROJECT_ROOT / "data"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from utils import _safe_literal, _to_int  # noqa: E402
 
 EPS = 1e-6
 
@@ -89,39 +92,15 @@ def _accumulate_zone_vector(df: pd.DataFrame, value_col: str = "value") -> np.nd
     for xx, yy, vv in zip(x[valid], y[valid], v[valid]):
         vec[map_to_12_zones(float(xx), float(yy))] += float(vv)
     return vec
-# 기능: _safe_density_divide는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 누적 12D 벡터를 per-90 밀도 벡터로 변환한다 (분모 0 방지 포함).
 # 데이터 입출력:
-#   - Input: vec: np.ndarray, exposure90: float
-#   - Output: np.ndarray
+#   - Input: vec [12], exposure90: float — 경기 수 분모
+#   - Output: np.ndarray [12] float32
 def _safe_density_divide(vec: np.ndarray, exposure90: float) -> np.ndarray:
     return (vec / float(max(exposure90, 1e-6))).astype(np.float32)
 
 
-# ----------------------------
-# Parsing utilities
-# ----------------------------
-# 기능: _safe_literal는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: value
-#   - Output: 코드 내부 return 표현식
-def _safe_literal(value):
-    if isinstance(value, (list, dict)):
-        return value
-    if pd.isna(value):
-        return None
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return ast.literal_eval(text)
-    except (SyntaxError, ValueError):
-        return None
-# 기능: _safe_eval_list는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 문자열 또는 리스트 값을 Python 리스트로 안전하게 변환한다. 파싱 실패 시 [] 반환.
 # 데이터 입출력:
 #   - Input: v: object
 #   - Output: list
@@ -138,18 +117,6 @@ def _safe_eval_list(v: object) -> list:
         except Exception:
             return []
     return []
-# 기능: _to_int는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: v: object
-#   - Output: int | None
-def _to_int(v: object) -> int | None:
-    try:
-        if pd.isna(v):
-            return None
-        return int(float(v))
-    except Exception:
-        return None
 # 기능: _extract_player_ids는 컬럼 'playerId'을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
 # 데이터 입출력:
@@ -188,20 +155,16 @@ def _load_event_tables(data_root: Path, league_mode: str) -> EventTables:
     base_vaep_path = data_root / "vaep/vaep_actions.parquet"
     eng_vaep_path = data_root / "vaep/vaep_actions_england_eval.parquet"
     io_candidates = [
-        data_root / "synergy/io_event_surfaces_base.parquet",
+        data_root / "synergy_england/io_event_surfaces_base.parquet",
         data_root / "synergy_ilp_unified_non_england/io_event_surfaces_base.parquet",
         data_root / "synergy_ioid_england_eval_preproc_all/io_event_surfaces_base.parquet",
     ]
     id_candidates = [
-        data_root / "synergy/id_event_surfaces_base.parquet",
+        data_root / "synergy_england/id_event_surfaces_base.parquet",
         data_root / "synergy_ilp_unified_non_england/id_event_surfaces_base.parquet",
         data_root / "synergy_ioid_england_eval_preproc_all/id_event_surfaces_base.parquet",
     ]
-    # 기능: _pick_first_existing_path는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-    # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-    # 데이터 입출력:
-    #   - Input: candidates: list[Path]
-    #   - Output: Path
+    # 기능: 후보 경로 중 첫 번째로 존재하는 경로를 반환한다.
     def _pick_first_existing_path(candidates: list[Path]) -> Path:
         for candidate in candidates:
             if candidate.exists():
@@ -328,11 +291,10 @@ def _extract_registered_squad_from_match(matches_df: pd.DataFrame, match_id: int
         if pid not in squad:
             squad.append(pid)
     return squad
-# 기능: _sanitize_available_player_ids는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 입력 player_id 시퀀스에서 None 제거·중복 제거·정수 변환을 수행하여 정제된 리스트를 반환한다.
 # 데이터 입출력:
 #   - Input: available_player_ids: Sequence[int] | None
-#   - Output: List[int]
+#   - Output: List[int] — 중복 없는 정수 player_id 리스트
 def _sanitize_available_player_ids(available_player_ids: Sequence[int] | None) -> List[int]:
     if available_player_ids is None:
         return []
@@ -408,11 +370,10 @@ class OutcomePrediction:
     draw_prob: float
     loss_prob: float
     expected_points: float
-# 기능: _resolve_scaler_block는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: scaler payload 딕셔너리에서 mean/std를 가진 블록을 우선순위 키 목록으로 검색한다.
 # 데이터 입출력:
-#   - Input: payload: dict, key_candidates: List[str]
-#   - Output: dict | None
+#   - Input: payload: dict, key_candidates: List[str] — 검색할 키 우선순위 목록
+#   - Output: dict({'mean':..., 'std':...}) | None
 def _resolve_scaler_block(payload: dict, key_candidates: List[str]) -> dict | None:
     for k in key_candidates:
         if k in payload and isinstance(payload[k], dict):
@@ -443,11 +404,7 @@ def _parse_feature_scaler_payload(payload: object) -> dict:
 
     if node_blk is None or pass_blk is None or def_blk is None:
         raise ValueError("scaler payload missing required blocks: node, passes_to, defends_against")
-    # 기능: _to_1d는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-    # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-    # 데이터 입출력:
-    #   - Input: name: str, x: object
-    #   - Output: torch.Tensor
+    # 기능: scaler 값을 1D float32 텐서로 변환한다. 빈 텐서이면 ValueError를 발생시킨다.
     def _to_1d(name: str, x: object) -> torch.Tensor:
         t = torch.as_tensor(x, dtype=torch.float32).view(-1)
         if t.numel() == 0:
@@ -466,11 +423,10 @@ def _parse_feature_scaler_payload(payload: object) -> dict:
         s = scaler[k]
         scaler[k] = torch.where(s.abs() > EPS, s, torch.ones_like(s))
     return scaler
-# 기능: _load_feature_scaler는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 별도 scaler .pt 파일이 있으면 로드하여 파싱된 scaler 딕셔너리를 반환한다. None이면 None 반환.
 # 데이터 입출력:
 #   - Input: scaler_pt: Path | None
-#   - Output: dict | None
+#   - Output: dict | None (scaler_pt=None이거나 파일 없으면 None)
 def _load_feature_scaler(scaler_pt: Path | None) -> dict | None:
     if scaler_pt is None:
         return None
@@ -478,11 +434,10 @@ def _load_feature_scaler(scaler_pt: Path | None) -> dict | None:
         raise FileNotFoundError(f"scaler pt not found: {scaler_pt}")
     payload = torch.load(scaler_pt, map_location="cpu", weights_only=False)
     return _parse_feature_scaler_payload(payload)
-# 기능: _zscore_tensor는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 텐서에 (x-mean)/std z-score 변환을 적용한다. 브로드캐스팅으로 임의 차원 텐서에 동작한다.
 # 데이터 입출력:
-#   - Input: t: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
-#   - Output: torch.Tensor
+#   - Input: t: Tensor[..., D], mean: Tensor[D], std: Tensor[D]
+#   - Output: Tensor[..., D]
 def _zscore_tensor(t: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     return (t.to(torch.float32) - mean.view(*([1] * (t.ndim - 1)), -1)) / std.view(*([1] * (t.ndim - 1)), -1)
 # 기능: _apply_scaler_to_cache_inplace는 컬럼 'node_mean', 'node_std', 'passes_mean', 'passes_std', 'defends_mean'을 기준으로 함수 목적에 맞는 산출물을 만든다.
@@ -726,11 +681,12 @@ def build_matchup_cache(
 # ----------------------------
 # Fast graph assembly
 # ----------------------------
-# 기능: _complete_directed_no_self_edges는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: N개 노드에 대한 완전 방향 그래프(자기 자신 제외)의 edge_index를 생성한다.
+# 동작/맥락: IO 관계(passes_to)의 같은 팀 엣지 구조에 사용된다.
+#            N=11이면 11×10=110개 방향 엣지 → edge_index shape [2, 110]
 # 데이터 입출력:
-#   - Input: n: int
-#   - Output: torch.Tensor
+#   - Input: n: int — 노드 수 (선택된 11명)
+#   - Output: torch.Tensor [2, n*(n-1)] — [src_indices, dst_indices]
 def _complete_directed_no_self_edges(n: int) -> torch.Tensor:
     rows, cols = [], []
     for i in range(n):
@@ -740,11 +696,13 @@ def _complete_directed_no_self_edges(n: int) -> torch.Tensor:
             rows.append(i)
             cols.append(j)
     return torch.tensor([rows, cols], dtype=torch.long)
-# 기능: _full_bipartite_edges는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: n_left × n_right 완전 이분 그래프의 edge_index를 생성한다.
+# 동작/맥락: ID 관계(defends_against)의 교차 팀 엣지 구조에 사용된다.
+#            11×11=121개 엣지 → edge_index shape [2, 121]
 # 데이터 입출력:
-#   - Input: n_left: int, n_right: int
-#   - Output: torch.Tensor
+#   - Input: n_left: int — 출발 노드 수 (수비팀 11명)
+#            n_right: int — 도착 노드 수 (공격팀 11명)
+#   - Output: torch.Tensor [2, n_left*n_right]
 def _full_bipartite_edges(n_left: int, n_right: int) -> torch.Tensor:
     rows, cols = [], []
     for i in range(n_left):
@@ -752,11 +710,15 @@ def _full_bipartite_edges(n_left: int, n_right: int) -> torch.Tensor:
             rows.append(i)
             cols.append(j)
     return torch.tensor([rows, cols], dtype=torch.long)
-# 기능: _gather_pair_attrs는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 3D 캐시 텐서에서 선택된 선수 인덱스 쌍의 엣지 특징을 추출하여 2D 행렬로 반환한다.
+# 동작/맥락: cache_3d[i, j, :] 는 선수 i → 선수 j의 12D 공간 시너지 벡터를 사전 계산한 값이다.
+#            GA 루프 내 매 genome 평가마다 직접 VAEP를 재계산하는 대신 이 캐시를 조회하여 O(N²) 재계산을 방지한다.
+#            directed_no_self=True: IO 관계에서 자기 자신 제외 (passes_to 엣지에 self-loop 없음)
 # 데이터 입출력:
-#   - Input: cache_3d: torch.Tensor, selected: Sequence[int], directed_no_self: bool
-#   - Output: torch.Tensor
+#   - Input: cache_3d: torch.Tensor [N_squad, N_squad, 12] — 스쿼드 전체 IO 캐시
+#            selected: Sequence[int] — 선택된 11명의 스쿼드 내 인덱스
+#            directed_no_self: bool — True이면 i==j 조합 제외
+#   - Output: torch.Tensor [E, 12] — 선택된 쌍들의 엣지 특징 (E=110 for IO, E=121 for ID)
 def _gather_pair_attrs(cache_3d: torch.Tensor, selected: Sequence[int], directed_no_self: bool = True) -> torch.Tensor:
     attrs = []
     for i_idx in selected:
@@ -767,11 +729,11 @@ def _gather_pair_attrs(cache_3d: torch.Tensor, selected: Sequence[int], directed
     if not attrs:
         return torch.zeros((0, 12), dtype=torch.float32)
     return torch.stack(attrs, dim=0)
-# 기능: _gather_cross_attrs는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 3D 캐시 텐서에서 교차 팀(이분 그래프) 엣지 특징을 추출한다.
+# 동작/맥락: ID 관계의 home×away 엣지 특징 조회에 사용한다.
 # 데이터 입출력:
-#   - Input: cache_3d: torch.Tensor, left_sel: Sequence[int], right_sel: Sequence[int]
-#   - Output: torch.Tensor
+#   - Input: cache_3d [N_left, N_right, 12], left_sel [11], right_sel [11]
+#   - Output: Tensor [121, 12]
 def _gather_cross_attrs(cache_3d: torch.Tensor, left_sel: Sequence[int], right_sel: Sequence[int]) -> torch.Tensor:
     attrs = []
     for i_idx in left_sel:
@@ -780,16 +742,26 @@ def _gather_cross_attrs(cache_3d: torch.Tensor, left_sel: Sequence[int], right_s
     if not attrs:
         return torch.zeros((0, 12), dtype=torch.float32)
     return torch.stack(attrs, dim=0)
-# 기능: 선택된 home_sel/away_sel 인덱스로 캐시 텐서를 슬라이싱해 완전 방향그래프/완전 이분그래프 edge_index·edge_attr를 즉시 조립한다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: GA 루프 내에서 genome(선수 인덱스 11개) 하나에 대한 HeteroData를 캐시 조회로 즉시 조립한다.
+# 동작/맥락: build_rolling_gnn_dataset과 동일한 그래프 구조를 생성하되, 이벤트 DataFrame 재처리 없이
+#            사전 계산된 MatchupCache의 3D 텐서에서 선택된 선수 부분만 슬라이싱하여 조립한다.
+#   조립 결과:
+#     - home_team.x: cache.home.node_feat_24[home_sel] → [11, 24]
+#     - away_team.x: cache.away.node_feat_24[away_sel] → [11, 24]
+#     - (home_team, passes_to, home_team).edge_attr: cache.home_io[home_sel][:, home_sel] → [110, 12]
+#     - (away_team, passes_to, away_team).edge_attr: cache.away_io[away_sel][:, away_sel] → [110, 12]
+#     - (home_team, defends_against, away_team).edge_attr: cache.home_to_away_id[home_sel][:, away_sel] → [121, 12]
+#     - (away_team, defends_against, home_team).edge_attr: cache.away_to_home_id[away_sel][:, home_sel] → [121, 12]
+#   GA genome 하나 평가: 이 함수 호출(캐시 조회) + GNN forward pass 만으로 끝난다 → 매우 빠름
 # 데이터 입출력:
-#   - Input: cache: MatchupCache, home_sel: Sequence[int], away_sel: Sequence[int], global_features: torch.Tensor
-#   - Output: HeteroData
+#   - Input: cache: MatchupCache — 사전 계산된 스쿼드 전체의 3D 특징 캐시
+#            home_sel: Sequence[int] — 홈팀에서 선택된 11명의 스쿼드 내 인덱스
+#            away_sel: Sequence[int] — 어웨이팀에서 선택된 11명의 스쿼드 내 인덱스
+#   - Output: HeteroData — GNN forward에 바로 넣을 수 있는 완성된 그래프
 def build_fast_heterodata(
     cache: MatchupCache,
     home_sel: Sequence[int],
     away_sel: Sequence[int],
-    global_features: torch.Tensor,
 ) -> HeteroData:
     n_home = len(home_sel)
     n_away = len(away_sel)
@@ -830,7 +802,6 @@ def build_fast_heterodata(
     data[("away_team", "defends_against", "home_team")].edge_attr = away_id_attr
     data[("away_team", "defends_against", "home_team")].id_attr = away_id_attr
 
-    data["global_features"] = global_features.to(dtype=torch.float32)
     return data
 # 기능: _validate_subgraph_slice_shapes는 컬럼 'home_team', 'away_team'을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
@@ -882,11 +853,11 @@ def _lineup_signature(data: HeteroData) -> tuple[float, float]:
 # ----------------------------
 # Model loading and GA
 # ----------------------------
-# 기능: _import_model_module는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: train_gnn_phase5.py를 동적으로 import하여 HeteroEdgeGATWinPredictor 클래스에 접근한다.
+# 동작/맥락: optimize_lineup_ga_phase6.py가 train_gnn_phase5.py와 다른 디렉토리에 있어도 동작하도록 경로 기반 import를 사용한다.
 # 데이터 입출력:
-#   - Input: model_def_path: Path
-#   - Output: 코드 내부 return 표현식
+#   - Input: model_def_path: Path — train_gnn_phase5.py 절대 경로
+#   - Output: 모듈 객체 (mod.HeteroEdgeGATWinPredictor 접근 가능)
 def _import_model_module(model_def_path: Path):
     spec = importlib.util.spec_from_file_location("train_gnn_phase5", model_def_path)
     mod = importlib.util.module_from_spec(spec)
@@ -971,35 +942,12 @@ class _LegacyHeteroEdgeGATWinPredictor(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(hidden_channels, self.num_classes),
         )
-    # 기능: _node_batch는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-    # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-    # 데이터 입출력:
-    #   - Input: node_store
-    #   - Output: torch.Tensor
+    # 기능: 단일 그래프 추론 시 batch 속성 없어도 안전하게 0-벡터 batch를 반환한다.
     @staticmethod
     def _node_batch(node_store) -> torch.Tensor:
         if hasattr(node_store, "batch") and node_store.batch is not None:
             return node_store.batch
         return torch.zeros(node_store.x.size(0), dtype=torch.long, device=node_store.x.device)
-    # 기능: _extract_global_features는 컬럼 'global_features'을 기준으로 함수 목적에 맞는 산출물을 만든다.
-    # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-    # 데이터 입출력:
-    #   - Input: data, batch_size: int, device: torch.device
-    #   - Output: torch.Tensor
-    @staticmethod
-    def _extract_global_features(data, batch_size: int, device: torch.device) -> torch.Tensor:
-        if "global_features" not in data:
-            return torch.zeros((batch_size, 0), dtype=torch.float32, device=device)
-
-        gf = data["global_features"]
-        if gf.dim() == 1:
-            gf = gf.view(batch_size, -1)
-        elif gf.dim() == 2:
-            if gf.size(0) != batch_size:
-                gf = gf.view(batch_size, -1)
-        else:
-            gf = gf.view(batch_size, -1)
-        return gf.to(device=device, dtype=torch.float32)
     # 기능: forward는 컬럼 'home_team', 'away_team'을 기준으로 함수 목적에 맞는 산출물을 만든다.
     # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
     # 데이터 입출력:
@@ -1036,15 +984,19 @@ class _LegacyHeteroEdgeGATWinPredictor(nn.Module):
         away_batch = self._node_batch(data["away_team"])
         home_pool = global_mean_pool(x_dict["home_team"], home_batch)
         away_pool = global_mean_pool(x_dict["away_team"], away_batch)
-        global_features = self._extract_global_features(data, batch_size=home_pool.size(0), device=home_pool.device)
-
-        match_repr = torch.cat([home_pool, away_pool, global_features], dim=-1)
+        match_repr = torch.cat([home_pool, away_pool], dim=-1)
         return self.head(match_repr)
-# 기능: 체크포인트의 state_dict/model_config를 읽고 현재 클래스 또는 레거시 클래스에 안전 로딩해 추론 가능 모델과 scaler payload를 반환한다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 학습된 모델 체크포인트를 로드하고 추론 준비가 완료된 모델과 scaler payload를 반환한다.
+# 동작/맥락: 구버전/신버전 체크포인트를 자동 감지하여 적합한 모델 클래스로 복원한다:
+#   - state_dict 키가 "convs."로 시작 → _LegacyHeteroEdgeGATWinPredictor (HeteroConv 기반 구버전)
+#   - 그 외 → HeteroEdgeGATWinPredictor (4-인코더 + SemanticAttn 현재 버전)
+#   - LazyLinear 초기화: load_state_dict 전에 dummy forward 1회 수행 (실제 입력 차원으로 lazy param 초기화)
+#   - strict=False: 체크포인트와 모델 구조가 완전히 일치하지 않아도 로드 허용 (하위 호환성 유지)
 # 데이터 입출력:
-#   - Input: model_def_path: Path, ckpt_path: Path, device: torch.device
-#   - Output: 코드 내부 return 표현식
+#   - Input: model_def_path: Path — train_gnn_phase5.py 경로
+#            ckpt_path: Path      — 학습 완료 .pt 체크포인트 경로
+#            device: torch.device — 추론 디바이스 (cpu/cuda)
+#   - Output: Tuple[model (eval mode), ckpt_scaler_payload (dict or None)]
 def load_trained_model(model_def_path: Path, ckpt_path: Path, device: torch.device):
     mod = _import_model_module(model_def_path)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -1083,7 +1035,6 @@ def load_trained_model(model_def_path: Path, ckpt_path: Path, device: torch.devi
     dummy[("away_team", "passes_to", "away_team")].edge_attr = torch.zeros((110, 12), dtype=torch.float32)
     dummy[("home_team", "defends_against", "away_team")].edge_attr = torch.zeros((121, 12), dtype=torch.float32)
     dummy[("away_team", "defends_against", "home_team")].edge_attr = torch.zeros((121, 12), dtype=torch.float32)
-    dummy["global_features"] = torch.zeros((4,), dtype=torch.float32)
     with torch.no_grad():
         _ = model(dummy)
 
@@ -1092,21 +1043,22 @@ def load_trained_model(model_def_path: Path, ckpt_path: Path, device: torch.devi
     model.eval()
     ckpt_scaler_payload = ckpt.get("feature_scaler") if isinstance(ckpt, dict) else None
     return model, ckpt_scaler_payload
-# 기능: _default_away_starting11는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 어웨이팀 스쿼드에서 exposure90(출전 경기 수) 상위 11명을 초기 선발 XI로 결정한다.
+# 동작/맥락: GA 최적화를 수행하지 않는 경우나 초기 어웨이 XI가 필요할 때 결정론적 기준선으로 사용한다.
 # 데이터 입출력:
 #   - Input: away_cache: TeamCache
-#   - Output: List[int]
+#   - Output: List[int] — 스쿼드 풀 내 인덱스 11개
 def _default_away_starting11(away_cache: TeamCache) -> List[int]:
     # choose by exposure desc as a deterministic baseline away XI
     scored = [(i, away_cache.exposure90.get(pid, 0.0)) for i, pid in enumerate(away_cache.squad_player_ids)]
     scored.sort(key=lambda kv: kv[1], reverse=True)
     return [idx for idx, _ in scored[:11]]
-# 기능: _to_away_outcome_prediction는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 홈팀 관점의 결과 확률을 어웨이팀 관점으로 변환한다.
+# 동작/맥락: 모델은 항상 홈팀 관점(P_win=홈 승)으로 예측한다. 어웨이팀 GA 최적화 시에는
+#            P_win↔P_loss를 뒤집어 어웨이팀 시각에서의 expected_points = 3·P_away_win + P_draw를 계산해야 한다.
 # 데이터 입출력:
-#   - Input: home_pred: OutcomePrediction
-#   - Output: OutcomePrediction
+#   - Input: home_pred: OutcomePrediction — 홈팀 관점 (win_prob=홈 승, loss_prob=홈 패=어웨이 승)
+#   - Output: OutcomePrediction — 어웨이팀 관점 (win_prob=어웨이 승=홈 패, loss_prob=어웨이 패=홈 승)
 def _to_away_outcome_prediction(home_pred: OutcomePrediction) -> OutcomePrediction:
     """Convert home-perspective probabilities into away-perspective probabilities."""
     away_win = float(home_pred.loss_prob)
@@ -1119,11 +1071,20 @@ def _to_away_outcome_prediction(home_pred: OutcomePrediction) -> OutcomePredicti
         loss_prob=away_loss,
         expected_points=float(away_expected_points),
     )
-# 기능: _predict_home_outcome_probs는 연산 softmax, temperature가 반영된 outcome 확률로 expected_points를 계산한다을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다. 특히 temperature가 반영된 outcome 확률로 expected_points를 계산한다를 고정 규칙으로 유지한다.
+# 기능: GNN 모델로 홈팀 경기 결과 확률(P_loss, P_draw, P_win)과 기대 승점을 계산한다.
+# 동작/맥락: temperature scaling을 적용하여 모델의 과신(overconfidence)을 보정한다.
+#   수식:
+#     probs = softmax(logits / T)   T=2.0 (기본값, 소프트맥스 분포를 평탄하게)
+#     P_loss = probs[0], P_draw = probs[1], P_win = probs[2]
+#     expected_points = 3·P_win + P_draw  (축구 승점 체계: 승=3점, 무=1점, 패=0점)
+#   GA 적합도 함수(fitness)로 이 expected_points를 사용한다.
+#   레거시 체크포인트(logits 1개): sigmoid로 P_win만 계산, P_draw=0으로 처리 (하위 호환성)
 # 데이터 입출력:
-#   - Input: model, data: HeteroData, device: torch.device, temperature: float
-#   - Output: OutcomePrediction
+#   - Input: model — eval 상태의 GNN 모델
+#            data: HeteroData — build_fast_heterodata()로 조립된 단일 그래프
+#            device: torch.device
+#            temperature: float — 소프트맥스 온도 (기본값 2.0, 높을수록 균등 분포에 가까워짐)
+#   - Output: OutcomePrediction — {win_prob, draw_prob, loss_prob, expected_points}
 def _predict_home_outcome_probs(
     model,
     data: HeteroData,
@@ -1157,34 +1118,29 @@ def _predict_home_outcome_probs(
         loss_prob=p_loss,
         expected_points=float(expected_points),
     )
-# 기능: _predict_home_win_prob는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 홈 승리 확률만 반환하는 하위 호환성 래퍼 (T=1.0 고정, expected_points 불필요한 경우 사용).
 # 데이터 입출력:
 #   - Input: model, data: HeteroData, device: torch.device
-#   - Output: float
+#   - Output: float — P(홈 승)
 def _predict_home_win_prob(model, data: HeteroData, device: torch.device) -> float:
     """Backward-compatible helper returning only home win probability."""
     pred = _predict_home_outcome_probs(model, data, device=device, temperature=1.0)
     return float(pred.win_prob)
-# 기능: _random_genome는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: n_pool 크기 풀에서 k개의 인덱스를 무작위 비복원추출하여 초기 genome을 생성한다.
 # 데이터 입출력:
-#   - Input: n_pool: int, k: int
-#   - Output: List[int]
+#   - Input: n_pool: int — 스쿼드 크기, k: int — 선발 수 (11)
+#   - Output: List[int] — 중복 없는 k개 인덱스
 def _random_genome(n_pool: int, k: int) -> List[int]:
     return random.sample(range(n_pool), k)
-# 기능: _repair_unique는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: genome: List[int], n_pool: int, k: int
-#   - Output: List[int]
+# 기능: fixed_idx 없을 때의 genome 복구 래퍼.
 def _repair_unique(genome: List[int], n_pool: int, k: int) -> List[int]:
     return _repair_unique_with_lock(genome=genome, n_pool=n_pool, k=k, fixed_idx=None)
-# 기능: _repair_unique_with_lock는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: genome에서 중복 인덱스를 제거하고 k개가 될 때까지 무작위 보충하여 유효한 genome을 복구한다.
+# 동작/맥락: 교차/변이 후 발생하는 중복·부족 문제를 수정하는 GA 복구 연산이다.
+#            fixed_idx가 지정되면 그 인덱스를 항상 genome의 첫 번째 자리에 보장한다.
 # 데이터 입출력:
-#   - Input: genome: List[int], n_pool: int, k: int, fixed_idx: int | None
-#   - Output: List[int]
+#   - Input: genome: List[int], n_pool, k, fixed_idx: int|None
+#   - Output: List[int] — 중복 없는 k개 인덱스, fixed_idx 포함 보장
 def _repair_unique_with_lock(genome: List[int], n_pool: int, k: int, fixed_idx: int | None) -> List[int]:
     out, used = [], set()
 
@@ -1207,34 +1163,38 @@ def _repair_unique_with_lock(genome: List[int], n_pool: int, k: int, fixed_idx: 
             out.append(c)
             used.add(c)
     return out
-# 기능: _crossover는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: p1: List[int], p2: List[int], n_pool: int, k: int
-#   - Output: List[int]
+# 기능: fixed_idx 없을 때의 단순 교차 (wrapper).
 def _crossover(p1: List[int], p2: List[int], n_pool: int, k: int) -> List[int]:
     return _crossover_with_lock(p1=p1, p2=p2, n_pool=n_pool, k=k, fixed_idx=None)
-# 기능: _crossover_with_lock는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 두 부모 genome을 단일 분기점(cut)에서 교차하여 자식 genome을 생성한다.
+# 동작/맥락: single-point crossover: child = p1[:cut] + p2[cut:]
+#            교차 후 중복 선수 인덱스가 생길 수 있으므로 _repair_unique_with_lock으로 복구한다.
+#            fixed_idx(GK): 교차 후 복구 과정에서도 GK 자리는 항상 fixed_idx로 고정된다.
 # 데이터 입출력:
-#   - Input: p1: List[int], p2: List[int], n_pool: int, k: int, fixed_idx: int | None
-#   - Output: List[int]
+#   - Input: p1, p2: List[int] — 부모 genome (스쿼드 내 선수 인덱스 11개)
+#            n_pool: int — 스쿼드 크기
+#            k: int — 선발 선수 수 (11)
+#            fixed_idx: int | None — 항상 포함할 선수 인덱스 (GK 고정용)
+#   - Output: List[int] — 자식 genome (중복 없는 11개 인덱스, fixed_idx 포함 보장)
 def _crossover_with_lock(p1: List[int], p2: List[int], n_pool: int, k: int, fixed_idx: int | None) -> List[int]:
     cut = random.randint(1, k - 1)
     child = p1[:cut] + p2[cut:]
     return _repair_unique_with_lock(child, n_pool=n_pool, k=k, fixed_idx=fixed_idx)
-# 기능: _mutate는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: g: List[int], n_pool: int, p_mut: float
-#   - Output: List[int]
+# 기능: fixed_idx 없을 때의 단순 변이 (wrapper).
 def _mutate(g: List[int], n_pool: int, p_mut: float) -> List[int]:
     return _mutate_with_lock(g=g, n_pool=n_pool, p_mut=p_mut, fixed_idx=None)
-# 기능: _mutate_with_lock는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 확률 p_mut으로 genome의 무작위 한 자리를 다른 선수 인덱스로 교체하는 단일 유전자 변이를 수행한다.
+# 동작/맥락: 돌연변이 적용 방식:
+#   - random.random() < p_mut이면 변이 발생, 아니면 그대로
+#   - 변이 위치: fixed_idx 제외한 자리 중 무작위 선택
+#   - 새 선수 인덱스: 기존 선발 목록에 없는 인덱스 중 무작위 선택 (최대 100회 시도)
+#   - 변이 후 _repair_unique_with_lock으로 중복 제거 및 fixed_idx 포함 보장
 # 데이터 입출력:
-#   - Input: g: List[int], n_pool: int, p_mut: float, fixed_idx: int | None
-#   - Output: List[int]
+#   - Input: g: List[int] — 현재 genome
+#            n_pool: int — 스쿼드 크기
+#            p_mut: float — 변이 발생 확률
+#            fixed_idx: int | None — 변이 불가 자리 (GK 인덱스)
+#   - Output: List[int] — 변이된 genome
 def _mutate_with_lock(g: List[int], n_pool: int, p_mut: float, fixed_idx: int | None) -> List[int]:
     out = g[:]
     if random.random() < p_mut:
@@ -1282,11 +1242,15 @@ def _build_player_position_map(players_csv: Path) -> Dict[int, str]:
         if code in {"GK", "DF", "MF", "FW"}:
             pos_map[int(pid)] = str(code)
     return pos_map
-# 기능: resolve_fixed_gk_index는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
+# 기능: 스쿼드 풀에서 GK 포지션 선수의 인덱스를 결정하고 GA 전 과정에서 고정한다.
+# 동작/맥락: GA는 11명 조합을 자유 탐색하지만, GK는 도메인 제약으로 항상 1명이 필요하다.
+#            우선순위: ①preferred_player_ids에 포함된 GK → ②스쿼드 풀에 있는 GK → ③없으면 ValueError
+#            GK 후보 중 exposure90(출전 경기 수)가 가장 높은 선수를 선택한다.
 # 데이터 입출력:
-#   - Input: team_cache: TeamCache, preferred_player_ids: Sequence[int], player_position_map: Dict[int, str]
-#   - Output: int
+#   - Input: team_cache: TeamCache — 스쿼드 풀 및 선수 특징 캐시
+#            preferred_player_ids: 실제 경기 명단에 있는 선수 ID (우선 GK 검색 범위)
+#            player_position_map: Dict[int, str] — {player_id: 포지션 코드 'GK'/'DF'/'MF'/'FW'}
+#   - Output: int — 스쿼드 풀 내 GK 선수의 인덱스 (genome에서 항상 포함할 fixed_idx)
 def resolve_fixed_gk_index(
     team_cache: TeamCache,
     preferred_player_ids: Sequence[int],
@@ -1309,27 +1273,43 @@ def resolve_fixed_gk_index(
 
     if not candidates:
         raise ValueError(f"No GK found in squad pool for team_id={team_cache.team_id}")
-    # 기능: _score는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-    # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-    # 데이터 입출력:
-    #   - Input: i: int
-    #   - Output: tuple[float, int]
+    # 기능: GK 후보 정렬 키. exposure90 내림차순, 인덱스 오름차순으로 결정론적으로 정렬한다.
     def _score(i: int) -> tuple[float, int]:
         pid = int(team_cache.squad_player_ids[int(i)])
         return (float(team_cache.exposure90.get(pid, 0.0)), -int(i))
 
     candidates.sort(key=_score, reverse=True)
     return int(candidates[0])
-# 기능: 고정 away_sel 조건에서 crossover/mutate/elitism을 반복하며 기대승점(expected_points) 기준으로 홈 11인 조합을 진화 탐색한다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다. 특히 temperature가 반영된 outcome 확률로 expected_points를 계산한다를 고정 규칙으로 유지한다.
+# 기능: 유전 알고리즘(GA)으로 홈팀 기대 승점(expected_points)을 최대화하는 11인 조합을 탐색한다.
+# 동작/맥락: GA 알고리즘 흐름:
+#   ① 초기 집단: pop_size개 genome 무작위 생성 (fixed_player_idx=GK 항상 포함)
+#   ② 세대 반복 (generations회):
+#      For each genome g in pop:
+#        data = build_fast_heterodata(cache, home_sel=g, away_sel)  # 캐시 조회
+#        _apply_scaler_to_graph_inplace(data, graph_scaler)          # z-score 변환
+#        pred = _predict_home_outcome_probs(model, data, T)          # GNN 추론
+#        fitness = pred.expected_points = 3·P_win + P_draw           # 적합도
+#      scored.sort(by fitness, descending)
+#      elites = scored[:elite_size]           # 엘리트 보존 (truncation selection)
+#      next_pop = elites + crossover+mutate   # 다음 세대 생성
+#   ③ best_g(최고 genome)과 best_pred(예측 결과) 반환
+#   특징: 캐시된 텐서 조회(O(1))로 per-genome 평가가 매우 빠름 → 대규모 집단/세대 탐색 가능
 # 데이터 입출력:
-#   - Input: model, cache: MatchupCache, away_sel: List[int], global_features: torch.Tensor, device: torch.device, pop_size: int, ...
-#   - Output: Tuple[List[int], OutcomePrediction]
+#   - Input: model — eval 상태 GNN 모델
+#            cache: MatchupCache — 사전 계산된 홈/어웨이 특징 캐시
+#            away_sel: List[int] — 고정된 어웨이팀 11인 인덱스
+#            pop_size: int — GA 집단 크기 (기본값: 30~50)
+#            generations: int — 세대 수 (기본값: 80~100)
+#            elite_size: int — 엘리트 보존 수 (기본값: 3~5)
+#            mutation_p: float — 변이 확률 (기본값: 0.2~0.3)
+#            temperature: float — 소프트맥스 온도 (기본값: 2.0)
+#            fixed_player_idx: int|None — 항상 포함할 선수 인덱스 (GK)
+#            graph_scaler: dict|None — z-score 스케일러 (None이면 변환 없음)
+#   - Output: Tuple[best_genome: List[int], best_pred: OutcomePrediction]
 def run_ga_optimize_home(
     model,
     cache: MatchupCache,
     away_sel: List[int],
-    global_features: torch.Tensor,
     device: torch.device,
     pop_size: int,
     generations: int,
@@ -1355,7 +1335,7 @@ def run_ga_optimize_home(
     for gen in range(1, generations + 1):
         scored = []
         for g in pop:
-            data = build_fast_heterodata(cache, home_sel=g, away_sel=away_sel, global_features=global_features)
+            data = build_fast_heterodata(cache, home_sel=g, away_sel=away_sel)
             _apply_scaler_to_graph_inplace(data, graph_scaler)
 
             if verify_slicing and not slice_shapes_verified:
@@ -1409,19 +1389,6 @@ def run_ga_optimize_home(
 
 # ----------------------------
 # Main
-# ----------------------------
-# 기능: _build_global_features는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: match_date_utc: pd.Timestamp
-#   - Output: torch.Tensor
-def _build_global_features(match_date_utc: pd.Timestamp) -> torch.Tensor:
-    month = float(match_date_utc.month)
-    dow = float(match_date_utc.dayofweek)
-    month_rad = 2.0 * math.pi * (month - 1.0) / 12.0
-    is_weekend = 1.0 if int(dow) >= 5 else 0.0
-    arr = np.array([1.0, is_weekend, math.sin(month_rad), math.cos(month_rad)], dtype=np.float32)
-    return torch.tensor(arr, dtype=torch.float32)
 # 기능: _player_name_map는 연산 pd.read_csv을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: Phase6에서 캐시된 OFF/DEF/IO/ID 텐서를 재사용하며 GA 탐색으로 expected_points를 최대화하기 위해 필요하다.
 # 데이터 입출력:
@@ -1475,7 +1442,7 @@ def main() -> None:
     parser.add_argument(
         "--model-ckpt",
         type=Path,
-        default=DATA_DIR / "phase_5_lineup/data/gnn_phase5/hetero_edge_gat_win_ood_final.pt",
+        default=DATA_DIR / "phase_5_lineup/data/gnn_phase5/hetero_edge_gat_win_epoch10_l2.pt",
     )
     parser.add_argument(
         "--scaler-pt",
@@ -1539,14 +1506,11 @@ def main() -> None:
         else:
             print("[INFO] z-score scaler loaded from checkpoint payload for per-graph application")
 
-    gf = _build_global_features(asof_time)
-
     away_sel = _default_away_starting11(cache.away)
     best_home_sel, best_pred = run_ga_optimize_home(
         model=model,
         cache=cache,
         away_sel=away_sel,
-        global_features=gf,
         device=device,
         pop_size=int(args.pop_size),
         generations=int(args.generations),

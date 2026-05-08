@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
+import sys
+from functools import partial
 from pathlib import Path
 from typing import Iterable
 
@@ -13,6 +14,12 @@ import pandas as pd
 
 PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
 DATA_DIR = PROJECT_ROOT / "data"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from utils import _safe_literal as _safe_literal_base  # noqa: E402
+
+# Wyscout positions/tags fields expect [] on parse failure (downstream iterates).
+_safe_literal = partial(_safe_literal_base, default=[])
 
 
 FIELD_LENGTH = 105.0
@@ -26,25 +33,6 @@ PERIOD_MAP = {
     "E2": 4,
     "P": 5,
 }
-
-
-# 기능: 문자열로 저장된 리스트/딕셔너리(JSON 유사 텍스트)를 파이썬 객체로 안전 변환한다.
-# 동작: NaN/빈문자 처리 후 ast.literal_eval을 시도하고, 실패 시 빈 리스트를 반환한다.
-# 입출력/사용: _prepare_events, _load_home_teams 내부에서 positions/tags/teamsData 전처리에 사용된다.
-def _safe_literal(value):
-    if isinstance(value, (list, dict)):
-        return value
-    if pd.isna(value):
-        return []
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return []
-    try:
-        return ast.literal_eval(text)
-    except (SyntaxError, ValueError):
-        return []
 
 
 # 기능: 입력 파일 확장자(csv/json/jsonl/ndjson)에 맞춰 테이블을 DataFrame으로 로드한다.

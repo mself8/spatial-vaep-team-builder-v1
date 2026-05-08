@@ -15,8 +15,8 @@ Outputs:
 from __future__ import annotations
 
 import argparse
-import ast
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -24,35 +24,9 @@ import pandas as pd
 
 PROJECT_ROOT = next((p for p in Path(__file__).resolve().parents if p.name == "team-builder"), Path(__file__).resolve().parents[1])
 DATA_DIR = PROJECT_ROOT / "data"
-# 기능: _to_int는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 실제 선발(ground truth)과 예측 선발을 같은 키(game_id, team_id)로 맞춘 뒤 Hit-Rate/Jaccard를 논문 표 형태로 산출하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: v: object
-#   - Output: int | None
-def _to_int(v: object) -> int | None:
-    try:
-        if pd.isna(v):
-            return None
-        return int(float(v))
-    except Exception:
-        return None
-# 기능: _safe_literal는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
-# 동작/맥락: 실제 선발(ground truth)과 예측 선발을 같은 키(game_id, team_id)로 맞춘 뒤 Hit-Rate/Jaccard를 논문 표 형태로 산출하기 위해 필요하다.
-# 데이터 입출력:
-#   - Input: value: object
-#   - Output: 코드 내부 return 표현식
-def _safe_literal(value: object):
-    if isinstance(value, (list, dict)):
-        return value
-    if not isinstance(value, str):
-        return None
-    txt = value.strip()
-    if not txt:
-        return None
-    try:
-        return ast.literal_eval(txt)
-    except Exception:
-        return None
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from utils import _safe_literal, _to_int  # noqa: E402
 # 기능: _dedupe_keep_order는 현재 단계에서 필요한 중간 표현을 기준으로 함수 목적에 맞는 산출물을 만든다.
 # 동작/맥락: 실제 선발(ground truth)과 예측 선발을 같은 키(game_id, team_id)로 맞춘 뒤 Hit-Rate/Jaccard를 논문 표 형태로 산출하기 위해 필요하다.
 # 데이터 입출력:
