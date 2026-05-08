@@ -73,7 +73,7 @@ def mutate(genome, pool, needs, pos_map, mut_rate, fixed_gk_id):
 # =====================================================================
 # [Main Execution]
 # =====================================================================
-def run_phase5_ga(synergy_dir, archive_dir, output_dir, team_id, formation, available_player_ids, fixed_gk_id, **kwargs):
+def run_phase5_ga(synergy_dir, archive_dir, output_dir, team_id, formation, available_player_ids, fixed_gk_id, pop_size=50, generations=100, **kwargs):
     player_scores = pd.read_parquet(synergy_dir / "player_synergy_scores.parquet")
     players_df = pd.read_csv(archive_dir / "players.csv")
     
@@ -135,20 +135,21 @@ def run_phase5_ga(synergy_dir, archive_dir, output_dir, team_id, formation, avai
             pos_map[borrowed_id] = pos # 포지션 라벨 강제 변경
 
     # GA 실행
-    pop = init_population(50, pool_by_pos, needs, fixed_gk_id)
+    pop = init_population(pop_size, pool_by_pos, needs, fixed_gk_id)
     best_genome = None
     best_score = -float('inf')
+    elite_size = max(1, pop_size // 5)
 
-    for gen in range(1, 101):
+    for gen in range(1, generations + 1):
         scored = [(evaluate_fitness(g, vi_map, {}, {}, 1.0, 1.0, 1.0), g) for g in pop]
         scored.sort(key=lambda x: x[0], reverse=True)
         if scored[0][0] > best_score:
             best_score = scored[0][0]
             best_genome = scored[0][1][:]
-            
-        elites = [g for _, g in scored[:10]]
+
+        elites = [g for _, g in scored[:elite_size]]
         next_pop = elites[:]
-        while len(next_pop) < 50:
+        while len(next_pop) < pop_size:
             child = crossover(random.choice(elites), random.choice(elites), pool_by_pos, needs, pos_map, fixed_gk_id)
             next_pop.append(mutate(child, pool_by_pos, needs, pos_map, 0.2, fixed_gk_id))
         pop = next_pop
@@ -177,6 +178,8 @@ def main():
     parser.add_argument("--fixed-gk-id", type=int)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--formation", type=str, default="4-3-3")
+    parser.add_argument("--pop-size", type=int, default=50)
+    parser.add_argument("--generations", type=int, default=100)
     args = parser.parse_args()
     
     run_phase5_ga(**vars(args), synergy_dir=DATA_DIR/"synergy", archive_dir=DATA_DIR/"archive")

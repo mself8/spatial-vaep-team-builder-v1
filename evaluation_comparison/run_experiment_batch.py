@@ -12,6 +12,7 @@ What this script does:
 """
 
 import argparse
+import ast
 import importlib.util
 import json
 import random
